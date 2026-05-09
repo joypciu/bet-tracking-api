@@ -45,6 +45,8 @@ if [ ! -d ".git" ]; then
     print_success "Repository cloned"
 else
     print_info "Updating repository..."
+    # Set remote URL with token so fetch works for private repos
+    git remote set-url origin "$REPO_URL"
     git fetch origin "$DEPLOY_BRANCH"
     git checkout -f "$DEPLOY_BRANCH"
     git reset --hard "origin/$DEPLOY_BRANCH"

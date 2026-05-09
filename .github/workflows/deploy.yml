@@ -54,6 +54,8 @@ jobs:
         id: deploy_try_1
         continue-on-error: true
         uses: appleboy/ssh-action@v1.0.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USERNAME }}
@@ -61,13 +63,14 @@ jobs:
           port: ${{ secrets.VPS_PORT }}
           timeout: 60s
           command_timeout: 5m
+          envs: GH_TOKEN
           script: |
             set -e
             SERVICE_NAME="bet-tracking-api"
             SERVICE_DIR="/home/ubuntu/services/bet-tracking-api"
             BRANCH="main"
             PORT="5002"
-            REPO_URL="https://github.com/joypciu/bet-tracking-api.git"
+            REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/joypciu/bet-tracking-api.git"
 
             export SERVICE_NAME SERVICE_DIR DEPLOY_BRANCH="$BRANCH" API_PORT="$PORT" REPO_URL
             mkdir -p "$SERVICE_DIR"
@@ -90,6 +93,8 @@ jobs:
         id: deploy_try_2
         if: steps.deploy_try_1.outcome == 'failure'
         uses: appleboy/ssh-action@v1.0.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USERNAME }}
@@ -97,13 +102,14 @@ jobs:
           port: ${{ secrets.VPS_PORT }}
           timeout: 60s
           command_timeout: 5m
+          envs: GH_TOKEN
           script: |
             set -e
             SERVICE_NAME="bet-tracking-api"
             SERVICE_DIR="/home/ubuntu/services/bet-tracking-api"
             BRANCH="main"
             PORT="5002"
-            REPO_URL="https://github.com/joypciu/bet-tracking-api.git"
+            REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/joypciu/bet-tracking-api.git"
 
             export SERVICE_NAME SERVICE_DIR DEPLOY_BRANCH="$BRANCH" API_PORT="$PORT" REPO_URL
             mkdir -p "$SERVICE_DIR"
