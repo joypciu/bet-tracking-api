@@ -106,7 +106,11 @@ jobs:
             REPO_URL="https://github.com/joypciu/bet-tracking-api.git"
 
             export SERVICE_NAME SERVICE_DIR DEPLOY_BRANCH="$BRANCH" API_PORT="$PORT" REPO_URL
+            mkdir -p "$SERVICE_DIR"
             cd "$SERVICE_DIR"
+            if [ ! -d ".git" ]; then
+              git clone "$REPO_URL" .
+            fi
             chmod +x deploy.sh
             ./deploy.sh
             echo "✅ deployment completed (attempt 2)"
