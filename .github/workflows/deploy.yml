@@ -1,0 +1,132 @@
+name: Deploy Bet Tracking API to VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  # ───────────────────────────────────────────
+  # Validate — syntax + fast import check
+  # ───────────────────────────────────────────
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check
+        run: |
+          echo "=== Syntax check ==="
+          python -m py_compile main.py bet_tracking.py sports_bridge.py
+          echo "✅ All files passed syntax check"
+
+      - name: Import check
+        run: |
+          echo "=== Import check ==="
+          python -c "import bet_tracking; import sports_bridge; print('imports ok')"
+          echo "✅ Imports ok"
+
+  # ───────────────────────────────────────────
+  # Deploy — only on push to main
+  # ───────────────────────────────────────────
+  deploy:
+    needs: validate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Deploy to VPS (attempt 1)
+        id: deploy_try_1
+        continue-on-error: true
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          timeout: 60s
+          command_timeout: 5m
+          script: |
+            set -e
+            SERVICE_NAME="bet-tracking-api"
+            SERVICE_DIR="/home/ubuntu/services/bet-tracking-api"
+            BRANCH="main"
+            PORT="5002"
+            REPO_URL="https://github.com/joypciu/bet-tracking-api.git"
+
+            export SERVICE_NAME SERVICE_DIR DEPLOY_BRANCH="$BRANCH" API_PORT="$PORT" REPO_URL
+            mkdir -p "$SERVICE_DIR"
+            cd "$SERVICE_DIR"
+            if [ ! -d ".git" ]; then
+              git clone "$REPO_URL" .
+            fi
+            chmod +x deploy.sh
+            ./deploy.sh
+
+            echo "=== service status ==="
+            sudo systemctl status bet-tracking-api --no-pager || true
+            echo "✅ deployment completed"
+
+      - name: Wait before retry
+        if: steps.deploy_try_1.outcome == 'failure'
+        run: sleep 10
+
+      - name: Deploy to VPS (attempt 2)
+        id: deploy_try_2
+        if: steps.deploy_try_1.outcome == 'failure'
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          timeout: 60s
+          command_timeout: 5m
+          script: |
+            set -e
+            SERVICE_NAME="bet-tracking-api"
+            SERVICE_DIR="/home/ubuntu/services/bet-tracking-api"
+            BRANCH="main"
+            PORT="5002"
+            REPO_URL="https://github.com/joypciu/bet-tracking-api.git"
+
+            export SERVICE_NAME SERVICE_DIR DEPLOY_BRANCH="$BRANCH" API_PORT="$PORT" REPO_URL
+            cd "$SERVICE_DIR"
+            chmod +x deploy.sh
+            ./deploy.sh
+            echo "✅ deployment completed (attempt 2)"
+
+      - name: Fail if both attempts failed
+        if: steps.deploy_try_1.outcome == 'failure' && steps.deploy_try_2.outcome == 'failure'
+        run: |
+          echo "❌ Deployment failed after 2 SSH attempts."
+          exit 1
+
+      - name: Health check
+        if: steps.deploy_try_1.outcome == 'success' || steps.deploy_try_2.outcome == 'success'
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          timeout: 30s
+          command_timeout: 1m
+          script: |
+            curl -fsS http://localhost:5002/ && echo "✅ Health check passed" || echo "⚠️ Health check failed"
+            sudo systemctl status bet-tracking-api --no-pager | head -10
