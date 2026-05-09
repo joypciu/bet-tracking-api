@@ -188,8 +188,26 @@ class CreateBetRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 _LEAGUE_TO_ESPN_PATH: dict[str, tuple[str, str]] = {
+    # Tennis
     "atp": ("tennis", "atp"), "wta": ("tennis", "wta"),
     "itf": ("tennis", "itf-men"), "challenger": ("tennis", "atp-challenger"),
+    # Basketball
+    "nba": ("basketball", "nba"), "wnba": ("basketball", "wnba"),
+    "ncaab": ("basketball", "mens-college-basketball"),
+    "nba g league": ("basketball", "nba-g-league"),
+    # Baseball
+    "mlb": ("baseball", "mlb"),
+    # Hockey
+    "nhl": ("hockey", "nhl"),
+    # Soccer — scoreboard only (halftime via summary endpoint)
+    "epl": ("soccer", "eng.1"),   "eng.1": ("soccer", "eng.1"),
+    "laliga": ("soccer", "esp.1"), "esp.1": ("soccer", "esp.1"),
+    "bundesliga": ("soccer", "ger.1"), "ger.1": ("soccer", "ger.1"),
+    "seriea": ("soccer", "ita.1"), "ita.1": ("soccer", "ita.1"),
+    "ligue1": ("soccer", "fra.1"), "fra.1": ("soccer", "fra.1"),
+    "mls": ("soccer", "usa.1"),
+    "ucl": ("soccer", "uefa.champions"),
+    "uel": ("soccer", "uefa.europa"),
 }
 
 _AUTO_SETTLEABLE = {
@@ -197,6 +215,26 @@ _AUTO_SETTLEABLE = {
     "puck_line", "run_line",
     "total_goals", "total_runs", "total_corners",
     "both_teams_to_score",
+}
+
+# Period markets that can be auto-settled from ESPN linescore data
+_PERIOD_SETTLEABLE = {
+    # Basketball — quarter & half
+    "1st_quarter_moneyline", "1st_quarter_point_spread", "1st_quarter_total_points",
+    "1st_quarter_team_total",
+    "1st_half_moneyline", "1st_half_total_points", "1st_half_team_total",
+    "1st_half_home_team_total", "1st_half_away_team_total",
+    "2nd_half_moneyline", "2nd_half_total_points", "2nd_half_team_total",
+    "2nd_half_both_teams_to_score",
+    # Baseball — innings
+    "1st_inning_total_runs", "1st_3_innings_run_line", "1st_3_innings_total_runs",
+    "1st_5_innings_moneyline", "1st_5_innings_total", "1st_5_innings_team_total",
+    # Hockey — period
+    "1st_period_moneyline", "1st_period_total_goals",
+    "2nd_period_moneyline", "2nd_period_total_goals",
+    # Soccer — halftime (via ESPN summary endpoint)
+    "1st_half_both_teams_to_score", "1st_half_total_goals",
+    "1st_half_asian_total_goals", "1st_half_draw_bet",
 }
 
 
@@ -209,6 +247,343 @@ async def _resolve_game_for_bet(bet: dict) -> tuple[str | None, str | None, str 
     home_team = bet.get("home_team")
     away_team = bet.get("away_team")
     return event_id, home_team, away_team
+
+
+async def _espn_fetch_competition(bet: dict) -> tuple[dict | None, str | None]:
+    """
+    Fetch the ESPN competition object for a bet.
+    Returns (competition_dict, league_path) or (None, None).
+    For soccer, also returns the event_id so the caller can fetch halftime via summary.
+    """
+    import httpx as _httpx
+
+    league = (bet.get("league") or "").lower().strip()
+    sport  = (bet.get("sport")  or "").lower().strip()
+    date   = bet.get("date")
+
+    espn_path = _LEAGUE_TO_ESPN_PATH.get(league)
+    if not espn_path:
+        # Infer from sport when league is missing
+        if "basketball" in sport:
+            espn_path = ("basketball", "nba")
+        elif "baseball" in sport:
+            espn_path = ("baseball", "mlb")
+        elif "hockey" in sport:
+            espn_path = ("hockey", "nhl")
+        elif "tennis" in sport:
+            espn_path = ("tennis", "atp")
+        elif "soccer" in sport or "football" in sport:
+            espn_path = ("soccer", "eng.1")
+
+    if not espn_path or not date:
+        return None, None
+
+    sport_path, league_path = espn_path
+    url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/{league_path}/scoreboard"
+
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(url, params={"dates": date.replace("-", ""), "limit": 100},
+                                 headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                return None, None
+            data = r.json()
+    except Exception:
+        return None, None
+
+    all_competitions: list[dict] = []
+    for event in data.get("events", []):
+        groupings = event.get("groupings")
+        comps = []
+        if groupings:
+            for g in groupings:
+                comps.extend(g.get("competitions", []))
+        else:
+            comps = event.get("competitions", [event])
+        for c in comps:
+            c["_event_id"] = event.get("id", "")
+            c["_league_path"] = league_path
+            c["_sport_path"] = sport_path
+        all_competitions.extend(comps)
+
+    home_want = (bet.get("home_team") or "").lower()
+    away_want = (bet.get("away_team") or "").lower()
+    team_want = (bet.get("team") or "").lower()
+
+    def _comp_names(comp: dict) -> list[str]:
+        out = []
+        for c in comp.get("competitors", []):
+            for key in ("athlete", "team"):
+                obj = c.get(key) or {}
+                for field in ("displayName", "shortDisplayName", "abbreviation", "lastName"):
+                    v = obj.get(field)
+                    if v:
+                        out.append(v.lower())
+        return out
+
+    def _name_matches(wanted: str, name_list: list[str]) -> bool:
+        w = wanted.lower()
+        return any(w in n or n in w for n in name_list)
+
+    for comp in all_competitions:
+        names = _comp_names(comp)
+        if home_want and away_want:
+            if _name_matches(home_want, names) and _name_matches(away_want, names):
+                return comp, league_path
+        elif team_want:
+            if _name_matches(team_want, names):
+                return comp, league_path
+
+    return None, None
+
+
+async def _espn_settle_period_bet(bet: dict) -> dict | None:
+    """Settle period/half/inning markets using ESPN linescore data (free, no key needed)."""
+    import httpx as _httpx
+
+    market   = (bet.get("market") or "").lower()
+    pick_raw = (bet.get("pick")   or "").lower()
+    line_val = bet.get("line")
+    sport    = (bet.get("sport")  or "").lower()
+
+    comp, league_path = await _espn_fetch_competition(bet)
+    if not comp:
+        return None
+
+    st = comp.get("status", {})
+    if st.get("type", {}).get("state") != "post":
+        return {
+            "outcome": "pending", "settled": False, "source": "espn_public",
+            "score": None, "pricing": None,
+            "note": f"Game not yet final — {st.get('type', {}).get('description', 'in progress')}",
+        }
+
+    competitors = comp.get("competitors", [])
+    home_comp = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0] if competitors else {})
+    away_comp = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1] if len(competitors) > 1 else {})
+
+    # ── Soccer: fetch halftime from summary endpoint ──────────────────────────
+    is_soccer = "soccer" in sport or "football" in sport or "soccer" in (comp.get("_sport_path") or "")
+    if is_soccer:
+        event_id = comp.get("_event_id", "")
+        lp       = comp.get("_league_path", league_path or "eng.1")
+        summary_url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{lp}/summary"
+        try:
+            async with _httpx.AsyncClient(timeout=10.0) as client:
+                sr = await client.get(summary_url, params={"event": event_id},
+                                      headers={"User-Agent": "Mozilla/5.0"})
+                if sr.status_code == 200:
+                    sdata = sr.json()
+                    for sc in (sdata.get("header", {}).get("competitions") or []):
+                        for c in sc.get("competitors", []):
+                            ha = c.get("homeAway", "")
+                            if ha == "home":
+                                home_comp = {**home_comp, "linescores": c.get("linescores", [])}
+                            elif ha == "away":
+                                away_comp = {**away_comp, "linescores": c.get("linescores", [])}
+        except Exception:
+            pass
+
+    def _period_scores(comp_c: dict) -> dict[int, float]:
+        out: dict[int, float] = {}
+        for i, ls in enumerate(comp_c.get("linescores") or [], start=1):
+            key = ls.get("period", i)
+            try:
+                out[key] = float(ls.get("value") or ls.get("displayValue") or 0)
+            except (TypeError, ValueError):
+                out[key] = 0.0
+        return out
+
+    home_scores = _period_scores(home_comp)
+    away_scores = _period_scores(away_comp)
+
+    if not home_scores and not away_scores:
+        return None
+
+    home_name = (home_comp.get("team", {}) or {}).get("displayName", "home")
+    away_name = (away_comp.get("team", {}) or {}).get("displayName", "away")
+
+    # Resolve pick side
+    if pick_raw == "home":
+        pick_scores, opp_scores = home_scores, away_scores
+    elif pick_raw == "away":
+        pick_scores, opp_scores = away_scores, home_scores
+    else:
+        hn = home_name.lower(); an = away_name.lower()
+        if pick_raw in hn or hn in pick_raw:
+            pick_scores, opp_scores = home_scores, away_scores
+        else:
+            pick_scores, opp_scores = away_scores, home_scores
+
+    def _sum(scores: dict, periods: list[int]) -> float:
+        return sum(scores.get(p, 0.0) for p in periods)
+
+    def _ml(ps: float, os: float) -> str:
+        return "win" if ps > os else ("loss" if ps < os else "push")
+
+    def _spread(ps: float, os: float, line: float) -> str:
+        adj = ps + line
+        return "win" if adj > os else ("loss" if adj < os else "push")
+
+    def _total(total: float, line: float, pick: str) -> str:
+        if pick == "over":
+            return "win" if total > line else ("push" if total == line else "loss")
+        return "win" if total < line else ("push" if total == line else "loss")
+
+    def _team_total(ps: float, line: float, pick: str) -> str:
+        if pick in ("over", "home", "away"):
+            pick_dir = "over" if pick == "over" else pick_raw
+        pick_dir = pick_raw
+        if pick_dir == "over":
+            return "win" if ps > line else ("push" if ps == line else "loss")
+        return "win" if ps < line else ("push" if ps == line else "loss")
+
+    outcome    = "pending"
+    period_det: dict = {}
+
+    # ── Basketball ────────────────────────────────────────────────────────────
+    if market == "1st_quarter_moneyline":
+        ps, os = _sum(pick_scores, [1]), _sum(opp_scores, [1])
+        period_det = {"pick_q1": ps, "opp_q1": os}
+        outcome = _ml(ps, os)
+
+    elif market == "1st_quarter_point_spread" and line_val is not None:
+        ps, os = _sum(pick_scores, [1]), _sum(opp_scores, [1])
+        period_det = {"pick_q1": ps, "opp_q1": os}
+        outcome = _spread(ps, os, float(line_val))
+
+    elif market == "1st_quarter_total_points" and line_val is not None:
+        total = _sum(home_scores, [1]) + _sum(away_scores, [1])
+        period_det = {"q1_total": total}
+        outcome = _total(total, float(line_val), pick_raw)
+
+    elif market == "1st_quarter_team_total" and line_val is not None:
+        ps = _sum(pick_scores, [1])
+        period_det = {"pick_q1": ps}
+        outcome = _team_total(ps, float(line_val), pick_raw)
+
+    elif market == "1st_half_moneyline":
+        ps, os = _sum(pick_scores, [1, 2]), _sum(opp_scores, [1, 2])
+        period_det = {"pick_1h": ps, "opp_1h": os}
+        outcome = _ml(ps, os)
+
+    elif market == "1st_half_total_points" and line_val is not None:
+        total = _sum(home_scores, [1, 2]) + _sum(away_scores, [1, 2])
+        period_det = {"first_half_total": total}
+        outcome = _total(total, float(line_val), pick_raw)
+
+    elif market in ("1st_half_team_total", "1st_half_home_team_total", "1st_half_away_team_total") and line_val is not None:
+        ps = _sum(pick_scores, [1, 2])
+        period_det = {"pick_1h": ps}
+        outcome = _team_total(ps, float(line_val), pick_raw)
+
+    elif market == "2nd_half_moneyline":
+        ps, os = _sum(pick_scores, [3, 4]), _sum(opp_scores, [3, 4])
+        period_det = {"pick_2h": ps, "opp_2h": os}
+        outcome = _ml(ps, os)
+
+    elif market == "2nd_half_total_points" and line_val is not None:
+        total = _sum(home_scores, [3, 4]) + _sum(away_scores, [3, 4])
+        period_det = {"second_half_total": total}
+        outcome = _total(total, float(line_val), pick_raw)
+
+    elif market == "2nd_half_team_total" and line_val is not None:
+        ps = _sum(pick_scores, [3, 4])
+        period_det = {"pick_2h": ps}
+        outcome = _team_total(ps, float(line_val), pick_raw)
+
+    elif market == "2nd_half_both_teams_to_score":
+        hs2 = _sum(home_scores, [3, 4]); as2 = _sum(away_scores, [3, 4])
+        period_det = {"home_2h": hs2, "away_2h": as2}
+        outcome = "win" if hs2 > 0 and as2 > 0 else "loss"
+
+    # ── Baseball ─────────────────────────────────────────────────────────────
+    elif market == "1st_inning_total_runs" and line_val is not None:
+        total = _sum(home_scores, [1]) + _sum(away_scores, [1])
+        period_det = {"1st_inn_total": total}
+        outcome = _total(total, float(line_val), pick_raw)
+
+    elif market == "1st_3_innings_run_line" and line_val is not None:
+        ps, os = _sum(pick_scores, [1, 2, 3]), _sum(opp_scores, [1, 2, 3])
+        period_det = {"pick_3inn": ps, "opp_3inn": os}
+        outcome = _spread(ps, os, float(line_val))
+
+    elif market == "1st_3_innings_total_runs" and line_val is not None:
+        total = _sum(home_scores, [1, 2, 3]) + _sum(away_scores, [1, 2, 3])
+        period_det = {"first_3inn_total": total}
+        outcome = _total(total, float(line_val), pick_raw)
+
+    elif market == "1st_5_innings_moneyline":
+        ps, os = _sum(pick_scores, [1, 2, 3, 4, 5]), _sum(opp_scores, [1, 2, 3, 4, 5])
+        period_det = {"pick_5inn": ps, "opp_5inn": os}
+        outcome = _ml(ps, os)
+
+    elif market == "1st_5_innings_total" and line_val is not None:
+        total = _sum(home_scores, [1, 2, 3, 4, 5]) + _sum(away_scores, [1, 2, 3, 4, 5])
+        period_det = {"first_5inn_total": total}
+        outcome = _total(total, float(line_val), pick_raw)
+
+    elif market == "1st_5_innings_team_total" and line_val is not None:
+        ps = _sum(pick_scores, [1, 2, 3, 4, 5])
+        period_det = {"pick_5inn": ps}
+        outcome = _team_total(ps, float(line_val), pick_raw)
+
+    # ── Hockey ───────────────────────────────────────────────────────────────
+    elif market == "1st_period_moneyline":
+        ps, os = _sum(pick_scores, [1]), _sum(opp_scores, [1])
+        period_det = {"pick_p1": ps, "opp_p1": os}
+        outcome = _ml(ps, os)
+
+    elif market == "1st_period_total_goals" and line_val is not None:
+        total = _sum(home_scores, [1]) + _sum(away_scores, [1])
+        period_det = {"p1_total": total}
+        outcome = _total(total, float(line_val), pick_raw)
+
+    elif market == "2nd_period_moneyline":
+        ps, os = _sum(pick_scores, [2]), _sum(opp_scores, [2])
+        period_det = {"pick_p2": ps, "opp_p2": os}
+        outcome = _ml(ps, os)
+
+    elif market == "2nd_period_total_goals" and line_val is not None:
+        total = _sum(home_scores, [2]) + _sum(away_scores, [2])
+        period_det = {"p2_total": total}
+        outcome = _total(total, float(line_val), pick_raw)
+
+    # ── Soccer halftime ───────────────────────────────────────────────────────
+    elif market in ("1st_half_both_teams_to_score", "1st_half_draw_bet",
+                    "1st_half_total_goals", "1st_half_asian_total_goals"):
+        # linescores index 0 = first half for soccer
+        h1 = home_scores.get(1, 0.0); a1 = away_scores.get(1, 0.0)
+        period_det = {"home_ht": h1, "away_ht": a1, "ht_total": h1 + a1}
+
+        if market == "1st_half_both_teams_to_score":
+            outcome = "win" if h1 > 0 and a1 > 0 else "loss"
+        elif market == "1st_half_draw_bet":
+            outcome = "win" if h1 == a1 else "loss"
+        elif market in ("1st_half_total_goals", "1st_half_asian_total_goals") and line_val is not None:
+            total = h1 + a1
+            outcome = _total(total, float(line_val), pick_raw)
+
+    else:
+        return None
+
+    if outcome == "pending":
+        return None
+
+    return {
+        "outcome": outcome,
+        "settled": True,
+        "source": "espn_public",
+        "score": {
+            "home": float(home_comp.get("score", 0) or 0),
+            "away": float(away_comp.get("score", 0) or 0),
+            "home_team": home_name,
+            "away_team": away_name,
+            "period_detail": period_det,
+        },
+        "pricing": None,
+        "note": f"Auto-settled from ESPN period data ({market})",
+    }
 
 
 async def _espn_settle_bet(bet: dict) -> dict | None:
@@ -402,6 +777,17 @@ async def _build_prop_settlement(bet: dict) -> dict:
 async def _build_settlement(bet: dict) -> dict:
     if _is_prop_market(bet.get("market", "")):
         return await _build_prop_settlement(bet)
+
+    if bet.get("market") in _PERIOD_SETTLEABLE:
+        result = await _espn_settle_period_bet(bet)
+        if result and result.get("outcome") in {"win", "loss", "push"} and result.get("settled"):
+            await run_in_threadpool(
+                bet_tracking.settle_bet, bet["bet_id"], result["outcome"], "espn_public",
+                (result.get("score") or {}).get("home"),
+                (result.get("score") or {}).get("away"),
+            )
+        if result:
+            return result
 
     if bet.get("market") not in _AUTO_SETTLEABLE or not bet.get("pick"):
         return {
@@ -656,25 +1042,19 @@ async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
             "first_td", "last_td", "first_basket",
             "player_double_double", "player_triple_double", "player_hat_trick",
         ],
+        "period_auto_settleable": sorted(_PERIOD_SETTLEABLE),
         "game_specialty": [
-            "both_teams_to_score", "will_there_be_a_tiebreak", "set_handicap",
-            "first_team_to_score", "1st_half_moneyline", "1st_half_draw_bet",
-            "1st_half_both_teams_to_score", "1st_half_total_points",
-            "1st_half_total_goals", "1st_half_asian_total_goals",
-            "1st_half_total_corners", "1st_half_team_total",
-            "1st_half_home_team_total", "1st_half_away_team_total",
-            "2nd_half_both_teams_to_score", "2nd_half_team_total",
-            "1st_quarter_moneyline", "1st_quarter_point_spread",
-            "1st_quarter_total_points", "1st_quarter_player_points",
-            "1st_quarter_team_total", "1st_3_innings_run_line",
-            "1st_5_innings_moneyline", "1st_5_innings_total",
-            "1st_5_innings_team_total", "team_total",
+            "will_there_be_a_tiebreak", "set_handicap",
+            "first_team_to_score", "1st_half_total_corners",
+            "1st_quarter_player_points", "team_total",
         ],
         "notes": (
             "Markets in 'espn_limitation' are tracked but will not auto-settle. "
-            "Markets in 'game_specialty' are period/specialty markets — "
-            "'both_teams_to_score' auto-settles from the final score; all others "
-            "must be settled manually via POST /bets/{bet_id}/settle."
+            "Markets in 'period_auto_settleable' settle automatically from ESPN "
+            "period/linescore data (NBA quarters/halves, MLB innings, NHL periods, "
+            "soccer halftime). "
+            "Markets in 'game_specialty' must be settled manually via "
+            "POST /bets/{bet_id}/settle."
         ),
     })
 
