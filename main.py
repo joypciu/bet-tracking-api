@@ -1093,6 +1093,56 @@ async def settle_bet(
     return JSONResponse(_bet_response(bet, settlement))
 
 
+class ManualSettleRequest(BaseModel):
+    outcome: str = Field(..., description="win | loss | push | void")
+    home_score: Optional[float] = Field(None, description="Optional final home score")
+    away_score: Optional[float] = Field(None, description="Optional final away score")
+    note: Optional[str] = Field(None, description="Optional reason / context")
+
+    @field_validator("outcome")
+    @classmethod
+    def validate_outcome(cls, v: str) -> str:
+        allowed = {"win", "loss", "push", "void"}
+        norm = v.strip().lower()
+        if norm not in allowed:
+            raise ValueError(f"outcome must be one of: {', '.join(sorted(allowed))}")
+        return norm
+
+
+@app.patch("/bets/{bet_id}", tags=["bets"])
+async def manual_settle_bet(
+    bet_id: str,
+    body:   ManualSettleRequest = Body(...),
+    token:  str                 = Depends(verify_token),
+) -> JSONResponse:
+    """Manually set the outcome of any pending bet."""
+    bet = await run_in_threadpool(bet_tracking.get_bet, bet_id)
+    if bet is None:
+        raise HTTPException(status_code=404, detail=f"Bet {bet_id!r} not found")
+    if bet["status"] != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Bet is already settled as '{bet['status']}'. Cannot override a settled bet.",
+        )
+
+    if body.outcome == "void":
+        updated = await run_in_threadpool(bet_tracking.void_bet, bet_id)
+    else:
+        updated = await run_in_threadpool(
+            bet_tracking.settle_bet,
+            bet_id, body.outcome, "manual",
+            body.home_score, body.away_score,
+        )
+
+    bet = await run_in_threadpool(bet_tracking.get_bet, bet_id) or bet
+    settlement = {
+        **_stored_settlement(bet),
+        "source": "manual",
+        "note": body.note or f"Manually settled as '{body.outcome}'",
+    }
+    return JSONResponse(_bet_response(bet, settlement))
+
+
 @app.delete("/bets/{bet_id}", tags=["bets"])
 async def delete_bet(
     bet_id: str,
