@@ -23,7 +23,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Body
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 load_dotenv()
 
@@ -88,6 +88,8 @@ class CreateBetRequest(BaseModel):
     email:      Optional[str]         = Field(None)
     book:       Optional[str]         = Field(None)
 
+    _raw_line: Optional[str] = PrivateAttr(default=None)
+
     @field_validator("market")
     @classmethod
     def validate_market(cls, v: str) -> str:
@@ -136,6 +138,9 @@ class CreateBetRequest(BaseModel):
 
     @model_validator(mode="after")
     def normalize(self) -> "CreateBetRequest":
+        if isinstance(self.line, str):
+            self._raw_line = self.line
+
         if self.datetime and not self.date:
             self.date = self.datetime[:10]
 
@@ -927,6 +932,8 @@ def _bet_response(bet: dict, settlement: dict | None = None) -> dict:
 
 
 def _selection_line_for_storage(body: CreateBetRequest) -> str | None:
+    if body._raw_line is not None:
+        return body._raw_line
     if isinstance(body.line, str):
         return body.line
     if body.line is None:
