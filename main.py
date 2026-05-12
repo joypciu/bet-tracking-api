@@ -161,6 +161,17 @@ class CreateBetRequest(BaseModel):
             if number:
                 self.line = float(number.group(1))
 
+        # For total markets: parse "Over 221.5" / "Under 47.5" into pick + numeric line.
+        _TOTAL_MARKETS = {"total", "total_goals", "total_runs", "total_corners", "game_total"}
+        if self.market in _TOTAL_MARKETS and isinstance(self.line, str):
+            raw_line = self.line.strip()
+            direction = re.search(r'\b(over|under)\b', raw_line, re.IGNORECASE)
+            if direction and not self.pick:
+                self.pick = direction.group(1).lower()
+            number = re.search(r'(\d+(?:\.\d+)?)\s*$', raw_line)
+            if number:
+                self.line = float(number.group(1))
+
         if self.pick is None and isinstance(self.line, str):
             raw = self.line.strip()
             if self.market == "moneyline":
