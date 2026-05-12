@@ -149,6 +149,18 @@ class CreateBetRequest(BaseModel):
                         self.away_team = right.strip()
                     break
 
+        # For player props: parse selection string into pick direction + numeric line.
+        # Handles strings like "Devin Vassell Under 1.5" or "Over 22.5" regardless
+        # of whether pick was already supplied in the payload.
+        if self.market.startswith("player_") and isinstance(self.line, str):
+            raw_line = self.line.strip()
+            direction = re.search(r'\b(over|under)\b', raw_line, re.IGNORECASE)
+            if direction and not self.pick:
+                self.pick = direction.group(1).lower()
+            number = re.search(r'(\d+(?:\.\d+)?)\s*$', raw_line)
+            if number:
+                self.line = float(number.group(1))
+
         if self.pick is None and isinstance(self.line, str):
             raw = self.line.strip()
             if self.market == "moneyline":
