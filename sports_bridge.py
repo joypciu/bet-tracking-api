@@ -93,7 +93,7 @@ async def fetch_prop_check(
     if date:     params["date"]     = date
     if sport:    params["sport"]    = sport
     if team:     params["team"]     = team
-    return await _get("/stats/market-check", params)
+    return await _get("/stats/prop-check", params)
 
 
 async def fetch_live(team: str | None = None) -> dict[str, Any]:
