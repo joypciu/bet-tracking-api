@@ -859,11 +859,20 @@ async def _build_settlement(bet: dict) -> dict:
                 "score": None, "pricing": None,
                 "note": "Cannot locate game — provide date + team name or event_id."}
 
+    # Normalise pick values that stats_api does not accept directly
+    effective_pick = bet["pick"]
+    _market = bet["market"]
+    if _market == "both_teams_to_score":
+        if effective_pick.lower() in ("over", "yes"):
+            effective_pick = "yes"
+        elif effective_pick.lower() in ("under", "no"):
+            effective_pick = "no"
+
     try:
         result = await sports_bridge.market_check(
             event_id=event_id, date=bet.get("date"), sport=bet.get("sport"),
             team=query_team, opponent=query_opponent,
-            market=bet["market"], pick=bet["pick"], line=bet.get("line"),
+            market=_market, pick=effective_pick, line=bet.get("line"),
         )
     except sports_bridge.StatsBridgeHTTPError as exc:
         if exc.status_code == 404:
