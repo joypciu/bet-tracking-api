@@ -648,7 +648,7 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
             for g in groupings:
                 all_competitions.extend(g.get("competitions", []))
         else:
-            all_competitions.append(event)
+            all_competitions.extend(event.get("competitions", [event]))
 
     home_want = (bet.get("home_team") or "").lower()
     away_want = (bet.get("away_team") or "").lower()
@@ -733,45 +733,64 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
     else:
         pick_comp, opp_comp = c0, c1
 
-    pick_sets  = _sets_won(pick_comp)
-    opp_sets   = _sets_won(opp_comp)
-    pick_games = _games_won(pick_comp)
-    opp_games  = _games_won(opp_comp)
-    c0_sets    = _sets_won(c0)
-    c1_sets    = _sets_won(c1)
-    c0_games   = _games_won(c0)
-    c1_games   = _games_won(c1)
+    # Tennis uses linescores; soccer and other sports use competitor.score directly
+    is_tennis = "tennis" in sport
+
+    def _get_score(c: dict) -> int:
+        try:
+            return int(c.get("score") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    if is_tennis:
+        pick_score = _sets_won(pick_comp)
+        opp_score  = _sets_won(opp_comp)
+        c0_score   = _sets_won(c0)
+        c1_score   = _sets_won(c1)
+        pick_total = _games_won(pick_comp)
+        opp_total  = _games_won(opp_comp)
+    else:
+        pick_score = _get_score(pick_comp)
+        opp_score  = _get_score(opp_comp)
+        c0_score   = _get_score(c0)
+        c1_score   = _get_score(c1)
+        pick_total = pick_score
+        opp_total  = opp_score
 
     outcome = "pending"
     if market == "moneyline":
-        if pick_sets > opp_sets: outcome = "win"
-        elif pick_sets < opp_sets: outcome = "loss"
+        if pick_score > opp_score: outcome = "win"
+        elif pick_score < opp_score: outcome = "loss"
         else: outcome = "push"
-    elif market in ("spread", "game spread"):
+    elif market in ("spread", "game spread", "puck_line", "run_line"):
         if line_val is not None:
-            adj = pick_games + float(line_val)
-            if adj > opp_games: outcome = "win"
-            elif adj < opp_games: outcome = "loss"
+            adj = pick_total + float(line_val)
+            if adj > opp_total: outcome = "win"
+            elif adj < opp_total: outcome = "loss"
             else: outcome = "push"
-    elif market in ("total", "over_under"):
-        total = pick_games + opp_games
+    elif market in ("total", "over_under", "total_goals", "total_runs"):
+        total = c0_score + c1_score
         if line_val is not None:
             if pick_raw == "over":
                 outcome = "win" if total > float(line_val) else ("push" if total == float(line_val) else "loss")
             else:
                 outcome = "win" if total < float(line_val) else ("push" if total == float(line_val) else "loss")
+    elif market == "both_teams_to_score":
+        bts = c0_score > 0 and c1_score > 0
+        if pick_raw in ("yes", "over"):
+            outcome = "win" if bts else "loss"
+        elif pick_raw in ("no", "under"):
+            outcome = "win" if not bts else "loss"
 
     pick_name = _display_name(pick_comp)
     opp_name  = _display_name(opp_comp)
     return {
         "outcome": outcome, "settled": True, "source": "espn_public",
         "score": {
-            "home": c0_sets, "away": c1_sets, "total": c0_sets + c1_sets,
+            "home": c0_score, "away": c1_score, "total": c0_score + c1_score,
             "pick_player": pick_name, "opp_player": opp_name,
-            "pick_sets": pick_sets, "opp_sets": opp_sets,
-            "pick_games": pick_games, "opp_games": opp_games,
-            "home_games": c0_games, "away_games": c1_games,
-            "description": f"{pick_name} {pick_sets}-{opp_sets} sets / {pick_games}-{opp_games} games vs {opp_name}",
+            "pick_score": pick_score, "opp_score": opp_score,
+            "description": f"{pick_name} {pick_score} - {opp_score} {opp_name}",
         },
         "pricing": None,
     }
