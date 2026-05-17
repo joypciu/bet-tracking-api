@@ -1089,13 +1089,18 @@ async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
             "player_fg_made", "player_ft_made", "player_goals", "player_saves",
             "player_yellow_cards", "player_goals_hockey", "player_assists_hockey",
             "player_hits", "player_rbis", "player_runs_cricket", "player_wickets_cricket",
+            "player_strikeouts", "player_earned_runs",
         ],
+        "auto_settleable_sources": {
+            "player_strikeouts":  "mlb_stats_api",
+            "player_earned_runs": "mlb_stats_api",
+        },
         "espn_limitation": [
             "player_pass_yards", "player_rush_yards", "player_receiving_yards",
             "player_pass_tds", "player_receptions", "player_tackles", "player_sacks",
             "player_interceptions", "player_carry_yards", "player_shots_on_target",
             "player_offsides", "player_cards", "player_aces", "player_double_faults",
-            "player_sets_won", "player_strikeouts", "player_earned_runs",
+            "player_sets_won",
             "anytime_scorer", "first_scorer", "last_scorer",
             "first_td", "last_td", "first_basket",
             "player_double_double", "player_triple_double", "player_hat_trick",
@@ -1112,7 +1117,9 @@ async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
             "period/linescore data (NBA quarters/halves, MLB innings, NHL periods, "
             "soccer halftime). "
             "Markets in 'game_specialty' must be settled manually via "
-            "POST /bets/{bet_id}/settle."
+            "POST /bets/{bet_id}/settle. "
+            "player_strikeouts and player_earned_runs settle via the official "
+            "MLB Stats API (statsapi.mlb.com) — see auto_settleable_sources."
         ),
     })
 
