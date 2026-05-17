@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Environment / secrets
+.env
+
+# Database (live data — never commit)
+*.db
+*.db-wal
+*.db-shm
+
+# Logs
+*.log
+
+# Temp / scratch
+*.tmp

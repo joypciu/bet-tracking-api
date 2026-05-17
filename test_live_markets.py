@@ -20,6 +20,7 @@ Run this while a game is live. Then re-run after the final whistle.
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -33,9 +34,9 @@ except ImportError:
     _DDGS_AVAILABLE = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BET_API_BASE  = "http://142.44.160.36:5002"
-BET_API_TOKEN = "J6zbakG6vi41QN7YFPdwzbzWqBeFVAsLZLKXHgiUnYE"
-TEST_EMAIL    = "live-market-test@eternity.dev"
+BET_API_BASE  = os.getenv("BET_API_BASE",  "http://localhost:5002")
+BET_API_TOKEN = os.getenv("BET_API_TOKEN", "")
+TEST_EMAIL    = os.getenv("TEST_EMAIL",    "live-market-test@eternity.dev")
 DEFAULT_STAKE = 10.0
 DEFAULT_ODDS  = -110
 
