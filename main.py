@@ -242,7 +242,25 @@ _AUTO_SETTLEABLE = {
     "moneyline", "spread", "total",
     "puck_line", "run_line",
     "total_goals", "total_runs", "total_corners",
+    "team_total", "1st_half_total_runs",
+    "1st_inning_moneyline", "1st_3_innings_moneyline", "1st_7_innings_moneyline",
+    "1st_inning_run_line", "1st_7_innings_run_line", "1st_half_run_line",
+    "2nd_inning_total_runs", "3rd_inning_total_runs", "4th_inning_total_runs",
+    "5th_inning_total_runs", "6th_inning_total_runs", "7th_inning_total_runs",
+    "8th_inning_total_runs", "9th_inning_total_runs",
+    "1st_inning_total_runs_odd_even", "1st_7_innings_total_runs", "total_runs_odd_even",
     "both_teams_to_score",
+}
+
+# MLB period markets that should settle via stats_api market-check (Savant /gf)
+_MLB_MARKETCHECK_ROUTED = {
+    "1st_half_total_runs", "team_total",
+    "1st_inning_moneyline", "1st_3_innings_moneyline", "1st_7_innings_moneyline",
+    "1st_inning_run_line", "1st_3_innings_run_line", "1st_7_innings_run_line", "1st_half_run_line",
+    "1st_inning_total_runs", "2nd_inning_total_runs", "3rd_inning_total_runs", "4th_inning_total_runs",
+    "5th_inning_total_runs", "6th_inning_total_runs", "7th_inning_total_runs", "8th_inning_total_runs",
+    "9th_inning_total_runs", "1st_3_innings_total_runs", "1st_7_innings_total_runs",
+    "1st_inning_total_runs_odd_even", "total_runs", "total_runs_odd_even",
 }
 
 # Period markets that can be auto-settled from ESPN linescore data
@@ -268,6 +286,22 @@ _PERIOD_SETTLEABLE = {
 
 def _is_prop_market(market: str) -> bool:
     return market.startswith("player_")
+
+
+def _line_for_settlement(bet: dict) -> float | None:
+    """Return numeric line from line field or selection_line text (e.g., 'Under 3.5')."""
+    raw_line = bet.get("line")
+    if isinstance(raw_line, (int, float)):
+        return float(raw_line)
+
+    selection_line = str(bet.get("selection_line") or "")
+    matches = re.findall(r"[-+]?\d+(?:\.\d+)?", selection_line)
+    if not matches:
+        return None
+    try:
+        return float(matches[-1])
+    except ValueError:
+        return None
 
 
 async def _resolve_game_for_bet(bet: dict) -> tuple[str | None, str | None, str | None]:
@@ -371,7 +405,7 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
 
     market   = (bet.get("market") or "").lower()
     pick_raw = (bet.get("pick")   or "").lower()
-    line_val = bet.get("line")
+    line_val = _line_for_settlement(bet)
     sport    = (bet.get("sport")  or "").lower()
 
     comp, league_path = await _espn_fetch_competition(bet)
@@ -832,7 +866,13 @@ async def _build_settlement(bet: dict) -> dict:
     if _is_prop_market(bet.get("market", "")):
         return await _build_prop_settlement(bet)
 
-    if bet.get("market") in _PERIOD_SETTLEABLE:
+    market = bet.get("market")
+    sport = (bet.get("sport") or "").lower()
+    use_espn_period = market in _PERIOD_SETTLEABLE and not (
+        sport == "baseball" and market in _MLB_MARKETCHECK_ROUTED
+    )
+
+    if use_espn_period:
         result = await _espn_settle_period_bet(bet)
         if result and result.get("outcome") in {"win", "loss", "push"} and result.get("settled"):
             await run_in_threadpool(
@@ -866,6 +906,8 @@ async def _build_settlement(bet: dict) -> dict:
                 "score": None, "pricing": None,
                 "note": "Cannot locate game — provide date + team name or event_id."}
 
+    line_value = _line_for_settlement(bet)
+
     # Normalise pick values that stats_api does not accept directly
     effective_pick = bet["pick"]
     _market = bet["market"]
@@ -879,7 +921,7 @@ async def _build_settlement(bet: dict) -> dict:
         result = await sports_bridge.market_check(
             event_id=event_id, date=bet.get("date"), sport=bet.get("sport"),
             team=query_team, opponent=query_opponent,
-            market=_market, pick=effective_pick, line=bet.get("line"),
+            market=_market, pick=effective_pick, line=line_value,
         )
     except sports_bridge.StatsBridgeHTTPError as exc:
         if exc.status_code == 404:
@@ -922,7 +964,7 @@ async def _build_settlement(bet: dict) -> dict:
             score.get("home"), score.get("away"),
         )
 
-        return {"outcome": outcome, "settled": settled, "source": source,
+    return {"outcome": outcome, "settled": settled, "source": source,
             "score": score if score else None, "pricing": result.get("pricing"),
             "event": result.get("event")}
 
