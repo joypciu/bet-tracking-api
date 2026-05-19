@@ -959,7 +959,7 @@ async def _build_settlement(bet: dict) -> dict:
         as_ = result.get("away_score")
         score = {"home": hs, "away": as_} if hs is not None or as_ is not None else {}
 
-    if outcome in {"win", "loss", "push"} and settled and source in ("historical", "espn_public"):
+    if outcome in {"win", "loss", "push"} and settled and source:
         await run_in_threadpool(
             bet_tracking.settle_bet,
             bet["bet_id"], outcome, source,
