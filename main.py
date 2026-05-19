@@ -817,7 +817,14 @@ async def _build_prop_settlement(bet: dict) -> dict:
     outcome = result.get("outcome", "pending")
     source  = result.get("source", "historical")
     if outcome in {"win", "loss", "push"} and result.get("settled"):
-        await run_in_threadpool(bet_tracking.settle_bet, bet["bet_id"], outcome, source)
+        stat_value = result.get("stat_value")
+        stat_name = result.get("market") or bet.get("market")
+        home_score = result.get("home_score")
+        away_score = result.get("away_score")
+        await run_in_threadpool(
+            bet_tracking.settle_bet, bet["bet_id"], outcome, source,
+            home_score, away_score, stat_value, stat_name
+        )
     return result
 
 
@@ -1088,10 +1095,20 @@ async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
             "player_steals", "player_blocks", "player_turnovers", "player_minutes",
             "player_fg_made", "player_ft_made", "player_goals", "player_saves",
             "player_yellow_cards", "player_goals_hockey", "player_assists_hockey",
-            "player_hits", "player_rbis", "player_runs_cricket", "player_wickets_cricket",
+            "player_hits", "player_rbis", "player_runs", "player_home_runs",
+            "player_doubles", "player_triples", "player_bases", "player_singles",
+            "player_hits_runs_rbis",
+            "player_runs_cricket", "player_wickets_cricket",
             "player_strikeouts", "player_earned_runs",
         ],
         "auto_settleable_sources": {
+            "player_runs": "mlb_period_props",
+            "player_home_runs": "mlb_period_props",
+            "player_doubles": "mlb_period_props",
+            "player_triples": "mlb_period_props",
+            "player_bases": "mlb_period_props",
+            "player_singles": "mlb_period_props",
+            "player_hits_runs_rbis": "mlb_period_props",
             "player_strikeouts":  "mlb_stats_api",
             "player_earned_runs": "mlb_stats_api",
         },
@@ -1115,7 +1132,9 @@ async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
             "Markets in 'espn_limitation' are tracked but will not auto-settle. "
             "Markets in 'period_auto_settleable' settle automatically from ESPN "
             "period/linescore data (NBA quarters/halves, MLB innings, NHL periods, "
-            "soccer halftime). "
+            "soccer halftime). MLB batting props like runs, home runs, doubles, "
+            "triples, bases, and singles settle from Baseball Savant /gf via the "
+            "mlb_period_props module. "
             "Markets in 'game_specialty' must be settled manually via "
             "POST /bets/{bet_id}/settle. "
             "player_strikeouts and player_earned_runs settle via the official "
