@@ -255,12 +255,14 @@ _AUTO_SETTLEABLE = {
 # MLB period markets that should settle via stats_api market-check (Savant /gf)
 _MLB_MARKETCHECK_ROUTED = {
     "1st_half_total_runs", "team_total",
+    "1st_half_moneyline", "run_line", "moneyline", "total_runs",
     "1st_inning_moneyline", "1st_3_innings_moneyline", "1st_7_innings_moneyline",
     "1st_inning_run_line", "1st_3_innings_run_line", "1st_7_innings_run_line", "1st_half_run_line",
+    "1st_5_innings_moneyline", "1st_5_innings_total", "1st_5_innings_team_total",
     "1st_inning_total_runs", "2nd_inning_total_runs", "3rd_inning_total_runs", "4th_inning_total_runs",
     "5th_inning_total_runs", "6th_inning_total_runs", "7th_inning_total_runs", "8th_inning_total_runs",
     "9th_inning_total_runs", "1st_3_innings_total_runs", "1st_7_innings_total_runs",
-    "1st_inning_total_runs_odd_even", "total_runs", "total_runs_odd_even",
+    "1st_inning_total_runs_odd_even", "total_runs_odd_even", "1st_half_team_total",
 }
 
 # Period markets that can be auto-settled from ESPN linescore data
