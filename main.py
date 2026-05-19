@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import uvicorn
@@ -1225,7 +1225,17 @@ async def settle_bet(
             "bet": _bet_response(bet),
         })
     settlement = await _build_settlement(bet)
-    bet = await run_in_threadpool(bet_tracking.get_bet, bet_id) or bet
+    fresh_bet = await run_in_threadpool(bet_tracking.get_bet, bet_id)
+    if fresh_bet is not None:
+        bet = fresh_bet
+    elif settlement.get("settled") and settlement.get("outcome") in {"win", "loss", "push", "void"}:
+        # Keep API response consistent even if immediate re-read fails.
+        bet = {
+            **bet,
+            "status": settlement["outcome"],
+            "settled_at": datetime.now(timezone.utc).isoformat(),
+            "settlement_source": settlement.get("source"),
+        }
     return JSONResponse(_bet_response(bet, settlement))
 
 
