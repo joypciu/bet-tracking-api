@@ -306,6 +306,29 @@ def _line_for_settlement(bet: dict) -> float | None:
         return None
 
 
+def _is_future_game(bet: dict) -> bool:
+    """Return True when bet is for a future game based on datetime/date fields."""
+    event_dt_raw = bet.get("event_datetime") or bet.get("datetime")
+    if isinstance(event_dt_raw, str) and event_dt_raw.strip():
+        try:
+            event_dt = datetime.fromisoformat(event_dt_raw.replace("Z", "+00:00"))
+            if event_dt.tzinfo is None or event_dt.utcoffset() is None:
+                event_dt = event_dt.replace(tzinfo=timezone.utc)
+            return event_dt > datetime.now(timezone.utc)
+        except ValueError:
+            pass
+
+    date_raw = bet.get("date")
+    if isinstance(date_raw, str) and date_raw.strip():
+        try:
+            game_date = datetime.strptime(date_raw, "%Y-%m-%d").date()
+            return game_date > datetime.now(timezone.utc).date()
+        except ValueError:
+            return False
+
+    return False
+
+
 async def _resolve_game_for_bet(bet: dict) -> tuple[str | None, str | None, str | None]:
     event_id  = bet.get("event_id")
     home_team = bet.get("home_team")
@@ -865,6 +888,16 @@ async def _build_prop_settlement(bet: dict) -> dict:
 
 
 async def _build_settlement(bet: dict) -> dict:
+    if _is_future_game(bet):
+        return {
+            "outcome": "pending",
+            "settled": False,
+            "source": None,
+            "score": None,
+            "pricing": None,
+            "note": "Game has not started yet.",
+        }
+
     if _is_prop_market(bet.get("market", "")):
         return await _build_prop_settlement(bet)
 
