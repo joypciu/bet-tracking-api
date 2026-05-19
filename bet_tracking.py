@@ -30,6 +30,8 @@ settlement_source TEXT
 book              TEXT
 home_score        INTEGER
 away_score        INTEGER
+player_stat_value REAL
+stat_name         TEXT
 """
 
 from __future__ import annotations
@@ -110,6 +112,9 @@ def init_db() -> None:
         for col in ("home_score", "away_score"):
             if col not in cols:
                 con.execute(f"ALTER TABLE bets ADD COLUMN {col} INTEGER")
+        for col in ("player_stat_value", "stat_name"):
+            if col not in cols:
+                con.execute(f"ALTER TABLE bets ADD COLUMN {col} TEXT")
         con.execute("CREATE INDEX IF NOT EXISTS idx_bets_player  ON bets(player)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_bets_user_id ON bets(user_id)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_bets_book    ON bets(book)")
@@ -282,11 +287,13 @@ def list_bets(
 
 
 def settle_bet(
-    bet_id:     str,
-    outcome:    str,
-    source:     str,
-    home_score: int | None = None,
-    away_score: int | None = None,
+    bet_id:              str,
+    outcome:             str,
+    source:              str,
+    home_score:          int | None = None,
+    away_score:          int | None = None,
+    player_stat_value:   float | None = None,
+    stat_name:           str | None = None,
 ) -> bool:
     if outcome == "pending":
         return False
@@ -296,10 +303,12 @@ def settle_bet(
             """
             UPDATE bets
             SET    outcome = ?, status = ?, settled_at = ?,
-                   settlement_source = ?, home_score = ?, away_score = ?
+                   settlement_source = ?, home_score = ?, away_score = ?,
+                   player_stat_value = ?, stat_name = ?
             WHERE  bet_id = ? AND status = 'pending'
             """,
-            (outcome, outcome, settled_at, source, home_score, away_score, bet_id),
+            (outcome, outcome, settled_at, source, home_score, away_score,
+             player_stat_value, stat_name, bet_id),
         )
         return cur.rowcount > 0
 
