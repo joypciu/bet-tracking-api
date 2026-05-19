@@ -905,7 +905,15 @@ async def _build_settlement(bet: dict) -> dict:
     outcome = result.get("outcome", "pending")
     settled = result.get("settled", False)
     source  = result.get("source")
-    score   = result.get("score") or {}
+
+    # stats_api market-check responses may return either:
+    # - score: {home, away, total}
+    # - home_score / away_score top-level fields
+    score = result.get("score")
+    if not isinstance(score, dict):
+        hs = result.get("home_score")
+        as_ = result.get("away_score")
+        score = {"home": hs, "away": as_} if hs is not None or as_ is not None else {}
 
     if outcome in {"win", "loss", "push"} and settled and source in ("historical", "espn_public"):
         await run_in_threadpool(
@@ -914,8 +922,8 @@ async def _build_settlement(bet: dict) -> dict:
             score.get("home"), score.get("away"),
         )
 
-    return {"outcome": outcome, "settled": settled, "source": source,
-            "score": result.get("score"), "pricing": result.get("pricing"),
+        return {"outcome": outcome, "settled": settled, "source": source,
+            "score": score if score else None, "pricing": result.get("pricing"),
             "event": result.get("event")}
 
 
