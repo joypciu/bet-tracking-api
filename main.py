@@ -242,9 +242,12 @@ _AUTO_SETTLEABLE = {
     "moneyline", "spread", "total",
     "puck_line", "run_line",
     "total_goals", "total_runs", "total_corners",
-    "team_total", "1st_half_total_runs",
+    "team_total", "1st_half_total_runs", "1st_half_team_total",
     "1st_inning_moneyline", "1st_3_innings_moneyline", "1st_7_innings_moneyline",
-    "1st_inning_run_line", "1st_7_innings_run_line", "1st_half_run_line",
+    "1st_half_moneyline", "1st_5_innings_moneyline",
+    "1st_inning_run_line", "1st_3_innings_run_line", "1st_7_innings_run_line", "1st_half_run_line",
+    "1st_5_innings_total", "1st_5_innings_team_total",
+    "1st_inning_total_runs", "1st_3_innings_total_runs",
     "2nd_inning_total_runs", "3rd_inning_total_runs", "4th_inning_total_runs",
     "5th_inning_total_runs", "6th_inning_total_runs", "7th_inning_total_runs",
     "8th_inning_total_runs", "9th_inning_total_runs",
@@ -973,6 +976,15 @@ async def _build_settlement(bet: dict) -> dict:
             return {"outcome": "pending", "settled": False, "source": None,
                     "score": None, "pricing": None,
                     "note": "Game not found — may be in the future or not yet tracked."}
+        if exc.status_code == 504:
+            return {
+                "outcome": "pending",
+                "settled": False,
+                "source": None,
+                "score": None,
+                "pricing": None,
+                "note": exc.detail or "Stats service timed out. Retry settlement.",
+            }
         return {"outcome": "unknown", "settled": False, "source": None,
                 "score": None, "pricing": None, "error": str(exc)}
     except Exception as exc:
@@ -1184,7 +1196,7 @@ async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
             "player_doubles", "player_triples", "player_bases", "player_singles",
             "player_hits_runs_rbis",
             "player_runs_cricket", "player_wickets_cricket",
-            "player_strikeouts", "player_earned_runs",
+            "player_strikeouts", "player_earned_runs", "player_outs",
         ],
         "auto_settleable_sources": {
             "player_runs": "mlb_period_props",
@@ -1196,6 +1208,7 @@ async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
             "player_hits_runs_rbis": "mlb_period_props",
             "player_strikeouts":  "mlb_stats_api",
             "player_earned_runs": "mlb_stats_api",
+            "player_outs":        "mlb_stats_api",
         },
         "espn_limitation": [
             "player_pass_yards", "player_rush_yards", "player_receiving_yards",
