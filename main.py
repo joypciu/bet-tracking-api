@@ -1319,6 +1319,7 @@ async def settle_pending_bets_for_user(
         "user_id": user_id,
         "total_pending": len(pending_bets),
         "processed": 0,
+        "skipped_not_started": 0,
         "win": 0,
         "loss": 0,
         "push": 0,
@@ -1328,22 +1329,16 @@ async def settle_pending_bets_for_user(
         "unknown": 0,
         "errors": 0,
     }
-    results: list[dict[str, Any]] = []
-
     for bet in pending_bets:
+        if _is_future_game(bet):
+            summary["skipped_not_started"] += 1
+            continue
+
         summary["processed"] += 1
         try:
             settlement = await _build_settlement(bet)
         except Exception as exc:
             summary["errors"] += 1
-            results.append({
-                "bet_id": bet.get("bet_id"),
-                "event": bet.get("event"),
-                "market": bet.get("market"),
-                "selection_line": bet.get("selection_line"),
-                "status": "error",
-                "error": str(exc),
-            })
             continue
 
         outcome = str(settlement.get("outcome") or "pending")
@@ -1359,21 +1354,9 @@ async def settle_pending_bets_for_user(
         else:
             summary["pending"] += 1
 
-        results.append({
-            "bet_id": bet.get("bet_id"),
-            "event": bet.get("event"),
-            "market": bet.get("market"),
-            "selection_line": bet.get("selection_line"),
-            "outcome": outcome,
-            "settled": settled,
-            "source": settlement.get("source"),
-            "note": settlement.get("note"),
-        })
-
     return JSONResponse({
         "found": True,
         "summary": summary,
-        "results": results,
     })
 
 
