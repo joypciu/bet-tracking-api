@@ -62,6 +62,7 @@ async def market_check(
     sport:    str | None,
     team:     str | None,
     opponent: str | None,
+    player:   str | None,
     market:   str,
     pick:     str,
     line:     float | None,
@@ -72,6 +73,7 @@ async def market_check(
     if sport:    params["sport"]    = sport
     if team:     params["team"]     = team
     if opponent: params["opponent"] = opponent
+    if player:   params["player"]   = player
     if line is not None: params["line"] = line
     return await _get("/stats/market-check", params)
 

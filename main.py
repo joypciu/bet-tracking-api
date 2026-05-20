@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 import uvicorn
@@ -253,6 +253,24 @@ _AUTO_SETTLEABLE = {
     "8th_inning_total_runs", "9th_inning_total_runs",
     "1st_inning_total_runs_odd_even", "1st_7_innings_total_runs", "total_runs_odd_even",
     "both_teams_to_score",
+    # NBA period/specialty markets routed via stats_api -> nba_period_props
+    "1st_quarter_total_points", "2nd_quarter_total_points",
+    "3rd_quarter_total_points", "4th_quarter_total_points",
+    "1st_quarter_total_points_odd_even", "2nd_quarter_total_points_odd_even",
+    "3rd_quarter_total_points_odd_even",
+    "1st_quarter_moneyline", "2nd_quarter_moneyline",
+    "3rd_quarter_moneyline", "4th_quarter_moneyline",
+    "1st_quarter_point_spread", "2nd_quarter_point_spread",
+    "3rd_quarter_point_spread", "4th_quarter_point_spread",
+    "1st_quarter_team_total", "2nd_quarter_team_total",
+    "3rd_quarter_team_total", "4th_quarter_team_total",
+    "1st_half_total_points", "1st_half_total_points_odd_even",
+    "2nd_half_total_points_odd_even", "1st_half_point_spread",
+    "1st_quarter_player_points", "2nd_quarter_player_points",
+    "3rd_quarter_player_points", "4th_quarter_player_points",
+    "1st_half_player_points", "2nd_half_player_points",
+    "total_points_odd_even", "will_there_be_overtime",
+    "team_first_basket", "first_basket", "first_basket_including_ft",
 }
 
 # MLB period markets that should settle via stats_api market-check (Savant /gf)
@@ -867,13 +885,96 @@ async def _build_prop_settlement(bet: dict) -> dict:
     if line is None:
         return {"outcome": "pending", "settled": False, "source": None,
                 "note": "Line value missing for prop settlement."}
-    event_id, home_team, _ = await _resolve_game_for_bet(bet)
+    event_id, home_team, away_team = await _resolve_game_for_bet(bet)
+    primary_team = bet.get("team") or home_team
     try:
         result = await sports_bridge.fetch_prop_check(
-            player=player, market=bet["market"], pick=bet["pick"],
-            line=float(line), event_id=event_id, date=bet.get("date"),
-            sport=bet.get("sport"), team=bet.get("team") or home_team,
+            player=player,
+            market=bet["market"],
+            pick=bet["pick"],
+            line=float(line),
+            event_id=event_id,
+            date=bet.get("date"),
+            sport=bet.get("sport"),
+            team=primary_team,
         )
+    except sports_bridge.StatsBridgeHTTPError as exc:
+        if exc.status_code == 404:
+            recovered = None
+
+            retry_dates: list[str | None] = [bet.get("date")]
+            try:
+                if bet.get("date"):
+                    d = datetime.strptime(str(bet.get("date")), "%Y-%m-%d").date()
+                    retry_dates.extend([
+                        (d - timedelta(days=1)).isoformat(),
+                        (d + timedelta(days=1)).isoformat(),
+                    ])
+            except ValueError:
+                pass
+
+            seen_dates: set[str | None] = set()
+            retry_dates = [d for d in retry_dates if not (d in seen_dates or seen_dates.add(d))]
+
+            team_variants: list[str | None] = [primary_team, home_team, away_team, bet.get("team")]
+            seen_teams: set[str | None] = set()
+            team_variants = [t for t in team_variants if t and not (t in seen_teams or seen_teams.add(t))]
+
+            sport_variants: list[str | None] = [bet.get("sport"), None]
+
+            for rd in retry_dates:
+                if recovered is not None:
+                    break
+                for rs in sport_variants:
+                    if recovered is not None:
+                        break
+                    for rt in team_variants:
+                        try:
+                            recovered = await sports_bridge.fetch_prop_check(
+                                player=player,
+                                market=bet["market"],
+                                pick=bet["pick"],
+                                line=float(line),
+                                event_id=None,
+                                date=rd,
+                                sport=rs,
+                                team=rt,
+                            )
+                            break
+                        except sports_bridge.StatsBridgeHTTPError as retry_exc:
+                            if retry_exc.status_code == 404:
+                                continue
+                            if retry_exc.status_code == 504:
+                                return {
+                                    "outcome": "pending",
+                                    "settled": False,
+                                    "source": None,
+                                    "note": retry_exc.detail or "Stats service timed out. Retry settlement.",
+                                }
+                            return {
+                                "outcome": "unknown",
+                                "settled": False,
+                                "source": None,
+                                "error": str(retry_exc),
+                            }
+
+            if recovered is None:
+                return {
+                    "outcome": "pending",
+                    "settled": False,
+                    "source": None,
+                    "note": "Game not found — it may be in the future or not yet tracked.",
+                }
+            result = recovered
+        elif exc.status_code == 504:
+            return {
+                "outcome": "pending",
+                "settled": False,
+                "source": None,
+                "note": exc.detail or "Stats service timed out. Retry settlement.",
+            }
+        else:
+            return {"outcome": "unknown", "settled": False, "source": None, "error": str(exc)}
     except Exception as exc:
         return {"outcome": "unknown", "settled": False, "source": None, "error": str(exc)}
     outcome = result.get("outcome", "pending")
@@ -959,23 +1060,94 @@ async def _build_settlement(bet: dict) -> dict:
         result = await sports_bridge.market_check(
             event_id=event_id, date=bet.get("date"), sport=bet.get("sport"),
             team=query_team, opponent=query_opponent,
+            player=bet.get("player"),
             market=_market, pick=effective_pick, line=line_value,
         )
     except sports_bridge.StatsBridgeHTTPError as exc:
         if exc.status_code == 404:
-            fallback = await _espn_settle_bet(bet)
-            if fallback is not None:
-                fb_outcome = fallback.get("outcome", "pending")
-                if fb_outcome in {"win", "loss", "push"} and fallback.get("settled"):
-                    fb_score = fallback.get("score") or {}
-                    await run_in_threadpool(
-                        bet_tracking.settle_bet, bet["bet_id"], fb_outcome, "espn_public",
-                        fb_score.get("home"), fb_score.get("away"),
-                    )
-                return fallback
-            return {"outcome": "pending", "settled": False, "source": None,
-                    "score": None, "pricing": None,
-                    "note": "Game not found — may be in the future or not yet tracked."}
+            # Retry with looser matching when event_id is missing or stale.
+            # This handles common feed mismatches (team/opponent orientation,
+            # sport label differences, and date rollovers around midnight UTC).
+            recovered_result = None
+            retry_dates: list[str | None] = [bet.get("date")]
+            try:
+                if bet.get("date"):
+                    d = datetime.strptime(str(bet.get("date")), "%Y-%m-%d").date()
+                    retry_dates.extend([(d - timedelta(days=1)).isoformat(), (d + timedelta(days=1)).isoformat()])
+            except ValueError:
+                pass
+
+            # preserve order while removing duplicates
+            seen_dates: set[str | None] = set()
+            retry_dates = [d for d in retry_dates if not (d in seen_dates or seen_dates.add(d))]
+
+            team_variants: list[tuple[str | None, str | None]] = [
+                (query_team, query_opponent),
+                (query_team, None),
+                (bet.get("team"), None),
+                (query_opponent, query_team),
+            ]
+            sport_variants: list[str | None] = [bet.get("sport"), None]
+
+            for rd in retry_dates:
+                if recovered_result is not None:
+                    break
+                for rs in sport_variants:
+                    if recovered_result is not None:
+                        break
+                    for rt, ro in team_variants:
+                        if not rt:
+                            continue
+                        try:
+                            recovered_result = await sports_bridge.market_check(
+                                event_id=None,
+                                date=rd,
+                                sport=rs,
+                                team=rt,
+                                opponent=ro,
+                                player=bet.get("player"),
+                                market=_market,
+                                pick=effective_pick,
+                                line=line_value,
+                            )
+                            break
+                        except sports_bridge.StatsBridgeHTTPError as retry_exc:
+                            if retry_exc.status_code == 404:
+                                continue
+                            if retry_exc.status_code == 504:
+                                return {
+                                    "outcome": "pending",
+                                    "settled": False,
+                                    "source": None,
+                                    "score": None,
+                                    "pricing": None,
+                                    "note": retry_exc.detail or "Stats service timed out. Retry settlement.",
+                                }
+                            return {
+                                "outcome": "unknown",
+                                "settled": False,
+                                "source": None,
+                                "score": None,
+                                "pricing": None,
+                                "error": str(retry_exc),
+                            }
+
+            if recovered_result is not None:
+                result = recovered_result
+            else:
+                fallback = await _espn_settle_bet(bet)
+                if fallback is not None:
+                    fb_outcome = fallback.get("outcome", "pending")
+                    if fb_outcome in {"win", "loss", "push"} and fallback.get("settled"):
+                        fb_score = fallback.get("score") or {}
+                        await run_in_threadpool(
+                            bet_tracking.settle_bet, bet["bet_id"], fb_outcome, "espn_public",
+                            fb_score.get("home"), fb_score.get("away"),
+                        )
+                    return fallback
+                return {"outcome": "pending", "settled": False, "source": None,
+                        "score": None, "pricing": None,
+                        "note": "Game not found — may be in the future or not yet tracked."}
         if exc.status_code == 504:
             return {
                 "outcome": "pending",
@@ -1013,6 +1185,7 @@ async def _build_settlement(bet: dict) -> dict:
 
     return {"outcome": outcome, "settled": settled, "source": source,
             "score": score if score else None, "pricing": result.get("pricing"),
+            "note": result.get("note"),
             "event": result.get("event")}
 
 
@@ -1184,19 +1357,94 @@ async def bets_analytics(token: str = Depends(verify_token)) -> JSONResponse:
     return JSONResponse(analytics)
 
 
+# @app.get("/bets/prop-markets", tags=["bets"])
+# async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
+#     return JSONResponse({
+#         "auto_settleable": [
+#             "player_points", "player_rebounds", "player_assists", "player_threes",
+#             "player_steals", "player_blocks", "player_turnovers", "player_minutes",
+#             "player_fg_made", "player_ft_made", "player_goals", "player_saves",
+#             "player_yellow_cards", "player_goals_hockey", "player_assists_hockey",
+#             "player_hits", "player_rbis", "player_runs", "player_home_runs",
+#             "player_doubles", "player_triples", "player_bases", "player_singles",
+#             "player_hits_runs_rbis",
+#             "player_runs_cricket", "player_wickets_cricket",
+#             "player_strikeouts", "player_earned_runs", "player_outs",
+#         ],
+#         "auto_settleable_sources": {
+#             "player_runs": "mlb_period_props",
+#             "player_home_runs": "mlb_period_props",
+#             "player_doubles": "mlb_period_props",
+#             "player_triples": "mlb_period_props",
+#             "player_bases": "mlb_period_props",
+#             "player_singles": "mlb_period_props",
+#             "player_hits_runs_rbis": "mlb_period_props",
+#             "player_strikeouts":  "mlb_stats_api",
+#             "player_earned_runs": "mlb_stats_api",
+#             "player_outs":        "mlb_stats_api",
+#         },
+#         "espn_limitation": [
+#             "player_pass_yards", "player_rush_yards", "player_receiving_yards",
+#             "player_pass_tds", "player_receptions", "player_tackles", "player_sacks",
+#             "player_interceptions", "player_carry_yards", "player_shots_on_target",
+#             "player_offsides", "player_cards", "player_aces", "player_double_faults",
+#             "player_sets_won",
+#             "anytime_scorer", "first_scorer", "last_scorer",
+#             "first_td", "last_td", "first_basket",
+#             "player_double_double", "player_triple_double", "player_hat_trick",
+#         ],
+#         "period_auto_settleable": sorted(_PERIOD_SETTLEABLE),
+#         "game_specialty": [
+#             "will_there_be_a_tiebreak", "set_handicap",
+#             "first_team_to_score", "1st_half_total_corners",
+#             "1st_quarter_player_points", "team_total",
+#         ],
+#         "notes": (
+#             "Markets in 'espn_limitation' are tracked but will not auto-settle. "
+#             "Markets in 'period_auto_settleable' settle automatically from ESPN "
+#             "period/linescore data (NBA quarters/halves, MLB innings, NHL periods, "
+#             "soccer halftime). MLB batting props like runs, home runs, doubles, "
+#             "triples, bases, and singles settle from Baseball Savant /gf via the "
+#             "mlb_period_props module. "
+#             "Markets in 'game_specialty' must be settled manually via "
+#             "POST /bets/{bet_id}/settle. "
+#             "player_strikeouts and player_earned_runs settle via the official "
+#             "MLB Stats API (statsapi.mlb.com) — see auto_settleable_sources."
+#         ),
+#     })
+
+
 @app.get("/bets/prop-markets", tags=["bets"])
 async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
     return JSONResponse({
         "auto_settleable": [
             "player_points", "player_rebounds", "player_assists", "player_threes",
+            "player_made_threes", "player_rebounds_assists", "player_points_rebounds_assists",
             "player_steals", "player_blocks", "player_turnovers", "player_minutes",
             "player_fg_made", "player_ft_made", "player_goals", "player_saves",
             "player_yellow_cards", "player_goals_hockey", "player_assists_hockey",
             "player_hits", "player_rbis", "player_runs", "player_home_runs",
             "player_doubles", "player_triples", "player_bases", "player_singles",
-            "player_hits_runs_rbis",
-            "player_runs_cricket", "player_wickets_cricket",
+            "player_hits_runs_rbis", "player_runs_cricket", "player_wickets_cricket",
             "player_strikeouts", "player_earned_runs", "player_outs",
+            "1st_quarter_total_points", "2nd_quarter_total_points",
+            "3rd_quarter_total_points", "4th_quarter_total_points",
+            "1st_quarter_total_points_odd_even", "2nd_quarter_total_points_odd_even",
+            "3rd_quarter_total_points_odd_even",
+            "1st_quarter_moneyline", "2nd_quarter_moneyline",
+            "3rd_quarter_moneyline", "4th_quarter_moneyline",
+            "1st_quarter_point_spread", "2nd_quarter_point_spread",
+            "3rd_quarter_point_spread", "4th_quarter_point_spread",
+            "1st_quarter_team_total", "2nd_quarter_team_total",
+            "3rd_quarter_team_total", "4th_quarter_team_total",
+            "1st_half_total_points", "1st_half_total_points_odd_even",
+            "2nd_half_total_points_odd_even", "1st_half_moneyline",
+            "1st_half_point_spread", "1st_half_team_total",
+            "1st_quarter_player_points", "2nd_quarter_player_points",
+            "3rd_quarter_player_points", "4th_quarter_player_points",
+            "1st_half_player_points", "2nd_half_player_points",
+            "total_points_odd_even", "will_there_be_overtime",
+            "team_first_basket", "first_basket", "first_basket_including_ft",
         ],
         "auto_settleable_sources": {
             "player_runs": "mlb_period_props",
@@ -1206,25 +1454,59 @@ async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
             "player_bases": "mlb_period_props",
             "player_singles": "mlb_period_props",
             "player_hits_runs_rbis": "mlb_period_props",
-            "player_strikeouts":  "mlb_stats_api",
+            "player_strikeouts": "mlb_stats_api",
             "player_earned_runs": "mlb_stats_api",
-            "player_outs":        "mlb_stats_api",
+            "player_outs": "mlb_stats_api",
+            "1st_quarter_player_points": "nba_period_props",
+            "2nd_quarter_player_points": "nba_period_props",
+            "3rd_quarter_player_points": "nba_period_props",
+            "4th_quarter_player_points": "nba_period_props",
+            "1st_half_player_points": "nba_period_props",
+            "2nd_half_player_points": "nba_period_props",
+            "1st_quarter_total_points": "nba_period_props",
+            "2nd_quarter_total_points": "nba_period_props",
+            "3rd_quarter_total_points": "nba_period_props",
+            "4th_quarter_total_points": "nba_period_props",
+            "1st_quarter_total_points_odd_even": "nba_period_props",
+            "2nd_quarter_total_points_odd_even": "nba_period_props",
+            "3rd_quarter_total_points_odd_even": "nba_period_props",
+            "1st_quarter_moneyline": "nba_period_props",
+            "2nd_quarter_moneyline": "nba_period_props",
+            "3rd_quarter_moneyline": "nba_period_props",
+            "4th_quarter_moneyline": "nba_period_props",
+            "1st_quarter_point_spread": "nba_period_props",
+            "2nd_quarter_point_spread": "nba_period_props",
+            "3rd_quarter_point_spread": "nba_period_props",
+            "4th_quarter_point_spread": "nba_period_props",
+            "1st_quarter_team_total": "nba_period_props",
+            "2nd_quarter_team_total": "nba_period_props",
+            "3rd_quarter_team_total": "nba_period_props",
+            "4th_quarter_team_total": "nba_period_props",
+            "1st_half_total_points": "nba_period_props",
+            "1st_half_total_points_odd_even": "nba_period_props",
+            "2nd_half_total_points_odd_even": "nba_period_props",
+            "1st_half_moneyline": "nba_period_props",
+            "1st_half_point_spread": "nba_period_props",
+            "1st_half_team_total": "nba_period_props",
+            "total_points_odd_even": "nba_period_props",
+            "will_there_be_overtime": "nba_period_props",
+            "team_first_basket": "nba_period_props",
+            "first_basket": "nba_period_props",
+            "first_basket_including_ft": "nba_period_props",
         },
         "espn_limitation": [
             "player_pass_yards", "player_rush_yards", "player_receiving_yards",
             "player_pass_tds", "player_receptions", "player_tackles", "player_sacks",
             "player_interceptions", "player_carry_yards", "player_shots_on_target",
             "player_offsides", "player_cards", "player_aces", "player_double_faults",
-            "player_sets_won",
-            "anytime_scorer", "first_scorer", "last_scorer",
-            "first_td", "last_td", "first_basket",
-            "player_double_double", "player_triple_double", "player_hat_trick",
+            "player_sets_won", "anytime_scorer", "first_scorer", "last_scorer",
+            "first_td", "last_td", "first_basket", "player_double_double",
+            "player_triple_double", "player_hat_trick",
         ],
         "period_auto_settleable": sorted(_PERIOD_SETTLEABLE),
         "game_specialty": [
-            "will_there_be_a_tiebreak", "set_handicap",
-            "first_team_to_score", "1st_half_total_corners",
-            "1st_quarter_player_points", "team_total",
+            "will_there_be_a_tiebreak", "set_handicap", "first_team_to_score",
+            "1st_half_total_corners", "team_total",
         ],
         "notes": (
             "Markets in 'espn_limitation' are tracked but will not auto-settle. "
@@ -1233,6 +1515,9 @@ async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
             "soccer halftime). MLB batting props like runs, home runs, doubles, "
             "triples, bases, and singles settle from Baseball Savant /gf via the "
             "mlb_period_props module. "
+            "NBA period player-points markets (1Q/2Q/3Q/4Q/1H/2H) settle via "
+            "nba_period_props "
+            "(DataBallr play-by-play and box score). "
             "Markets in 'game_specialty' must be settled manually via "
             "POST /bets/{bet_id}/settle. "
             "player_strikeouts and player_earned_runs settle via the official "
