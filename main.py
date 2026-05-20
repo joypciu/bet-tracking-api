@@ -1285,6 +1285,98 @@ async def settle_bet(
     return JSONResponse(_bet_response(bet, settlement))
 
 
+class BulkSettleRequest(BaseModel):
+    email: Optional[str] = Field(None, description="User email / Gmail address")
+
+    @model_validator(mode="after")
+    def normalize(self) -> "BulkSettleRequest":
+        if not self.email:
+            raise ValueError("email is required")
+        self.email = self.email.strip().lower()
+        return self
+
+
+@app.post("/bets/settle-pending", tags=["bets"])
+async def settle_pending_bets_for_user(
+    body: BulkSettleRequest = Body(...),
+    token: str = Depends(verify_token),
+) -> JSONResponse:
+    user = await run_in_threadpool(bet_tracking.get_user_by_email, body.email)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"No user found for email '{body.email}'")
+
+    user_id = user["user_id"]
+    pending_bets, _ = await run_in_threadpool(
+        bet_tracking.list_bets,
+        status="pending",
+        user_id=user_id,
+        limit=1000,
+        offset=0,
+    )
+
+    summary = {
+        "email": body.email,
+        "user_id": user_id,
+        "total_pending": len(pending_bets),
+        "processed": 0,
+        "win": 0,
+        "loss": 0,
+        "push": 0,
+        "void": 0,
+        "pending": 0,
+        "manual_settlement_needed": 0,
+        "unknown": 0,
+        "errors": 0,
+    }
+    results: list[dict[str, Any]] = []
+
+    for bet in pending_bets:
+        summary["processed"] += 1
+        try:
+            settlement = await _build_settlement(bet)
+        except Exception as exc:
+            summary["errors"] += 1
+            results.append({
+                "bet_id": bet.get("bet_id"),
+                "event": bet.get("event"),
+                "market": bet.get("market"),
+                "selection_line": bet.get("selection_line"),
+                "status": "error",
+                "error": str(exc),
+            })
+            continue
+
+        outcome = str(settlement.get("outcome") or "pending")
+        settled = bool(settlement.get("settled"))
+
+        if outcome in {"win", "loss", "push", "void"}:
+            summary[outcome] += 1
+        elif outcome == "not_settleable":
+            summary["manual_settlement_needed"] += 1
+        elif outcome == "unknown":
+            summary["unknown"] += 1
+            summary["manual_settlement_needed"] += 1
+        else:
+            summary["pending"] += 1
+
+        results.append({
+            "bet_id": bet.get("bet_id"),
+            "event": bet.get("event"),
+            "market": bet.get("market"),
+            "selection_line": bet.get("selection_line"),
+            "outcome": outcome,
+            "settled": settled,
+            "source": settlement.get("source"),
+            "note": settlement.get("note"),
+        })
+
+    return JSONResponse({
+        "found": True,
+        "summary": summary,
+        "results": results,
+    })
+
+
 class ManualSettleRequest(BaseModel):
     outcome: str = Field(..., description="win | loss | push | void")
     home_score: Optional[float] = Field(None, description="Optional final home score")
@@ -1299,6 +1391,20 @@ class ManualSettleRequest(BaseModel):
         if norm not in allowed:
             raise ValueError(f"outcome must be one of: {', '.join(sorted(allowed))}")
         return norm
+
+
+class BulkSettleRequest(BaseModel):
+    email: Optional[str] = Field(None, description="User email / Gmail address")
+    gmail_id: Optional[str] = Field(None, description="Alias for email / Gmail address")
+
+    @model_validator(mode="after")
+    def normalize(self) -> "BulkSettleRequest":
+        if not self.email and self.gmail_id:
+            self.email = self.gmail_id
+        if not self.email:
+            raise ValueError("email or gmail_id is required")
+        self.email = self.email.strip().lower()
+        return self
 
 
 @app.patch("/bets/{bet_id}", tags=["bets"])
