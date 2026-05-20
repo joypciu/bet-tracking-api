@@ -8,7 +8,7 @@ Environment variables
 ---------------------
 STATS_API_URL      Base URL of stats_api.py (e.g. http://localhost:8001).
 STATS_API_TOKEN    Bearer token for stats_api (optional).
-STATS_API_TIMEOUT  Max seconds per request (default 3.0).
+STATS_API_TIMEOUT  Max seconds per request (default 8.0).
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 
 _STATS_URL = os.getenv("STATS_API_URL", "http://localhost:8001").rstrip("/")
 _TOKEN     = os.getenv("STATS_API_TOKEN", "").strip()
-_TIMEOUT   = float(os.getenv("STATS_API_TIMEOUT", "3.0"))
+_TIMEOUT   = float(os.getenv("STATS_API_TIMEOUT", "8.0"))
 
 
 class StatsBridgeHTTPError(Exception):
@@ -44,8 +44,11 @@ async def _get(path: str, params: dict) -> dict:
     if not _STATS_URL:
         raise StatsBridgeHTTPError(503, "STATS_API_URL not configured")
     url = f"{_STATS_URL}{path}"
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        r = await client.get(url, params=params, headers=_headers())
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            r = await client.get(url, params=params, headers=_headers())
+    except httpx.TimeoutException as exc:
+        raise StatsBridgeHTTPError(504, f"stats_api timeout after {_TIMEOUT:.1f}s") from exc
     if r.status_code == 404:
         raise StatsBridgeHTTPError(404, r.text)
     if r.status_code != 200:
