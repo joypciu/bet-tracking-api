@@ -22,3 +22,5 @@ reference
 
 # Temp / scratch
 *.tmp
+
+venv
