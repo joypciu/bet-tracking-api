@@ -242,6 +242,8 @@ _LEAGUE_TO_ESPN_PATH: dict[str, tuple[str, str]] = {
     "mls": ("soccer", "usa.1"),
     "ucl": ("soccer", "uefa.champions"),
     "uel": ("soccer", "uefa.europa"),
+    # MMA
+    "ufc": ("mma", "ufc"), "mma": ("mma", "ufc"), "bellator": ("mma", "bellator"),
 }
 
 _AUTO_SETTLEABLE = {
@@ -277,6 +279,8 @@ _AUTO_SETTLEABLE = {
     "1st_half_player_points", "2nd_half_player_points",
     "total_points_odd_even", "will_there_be_overtime",
     "team_first_basket", "first_basket", "first_basket_including_ft",
+    # MMA markets
+    "go_the_distance", "total_rounds",
 }
 
 # MLB period markets that should settle via stats_api market-check (Savant /gf)
@@ -1504,6 +1508,8 @@ async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
             "1st_half_player_points", "2nd_half_player_points",
             "total_points_odd_even", "will_there_be_overtime",
             "team_first_basket", "first_basket", "first_basket_including_ft",
+            # MMA
+            "go_the_distance", "total_rounds",
         ],
         "auto_settleable_sources": {
             "player_runs": "mlb_period_props",
@@ -1552,6 +1558,9 @@ async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
             "team_first_basket": "nba_period_props",
             "first_basket": "nba_period_props",
             "first_basket_including_ft": "nba_period_props",
+            # MMA — ESPN scoreboard (with direct API fallback for past events)
+            "go_the_distance": "espn_mma",
+            "total_rounds": "espn_mma",
         },
         "espn_limitation": [
             "player_pass_yards", "player_rush_yards", "player_receiving_yards",
@@ -1575,8 +1584,10 @@ async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
             "triples, bases, and singles settle from Baseball Savant /gf via the "
             "mlb_period_props module. "
             "NBA period player-points markets (1Q/2Q/3Q/4Q/1H/2H) settle via "
-            "nba_period_props "
-            "(DataBallr play-by-play and box score). "
+            "nba_period_props (DataBallr play-by-play and box score). "
+            "MMA markets (go_the_distance, total_rounds, moneyline) settle via "
+            "ESPN UFC scoreboard with direct API fallback for past bouts. "
+            "Pick values for go_the_distance: yes/over (went distance) or no/under (early finish). "
             "Markets in 'game_specialty' must be settled manually via "
             "POST /bets/{bet_id}/settle. "
             "player_strikeouts and player_earned_runs settle via the official "
