@@ -239,8 +239,10 @@ _LEAGUE_TO_ESPN_PATH: dict[str, tuple[str, str]] = {
 }
 
 _AUTO_SETTLEABLE = {
+    # ── Core markets (all sports) ──────────────────────────────────────────
     "moneyline", "spread", "total",
     "puck_line", "run_line",
+    # ── Baseball ──────────────────────────────────────────────────────────
     "total_goals", "total_runs", "total_corners",
     "team_total", "1st_half_total_runs", "1st_half_team_total",
     "1st_inning_moneyline", "1st_3_innings_moneyline", "1st_7_innings_moneyline",
@@ -252,7 +254,31 @@ _AUTO_SETTLEABLE = {
     "5th_inning_total_runs", "6th_inning_total_runs", "7th_inning_total_runs",
     "8th_inning_total_runs", "9th_inning_total_runs",
     "1st_inning_total_runs_odd_even", "1st_7_innings_total_runs", "total_runs_odd_even",
+    # ── Soccer — full-game ─────────────────────────────────────────────────
     "both_teams_to_score",
+    "draw_bet",
+    "asian_total_goals",
+    "total_goals_odd_even",
+    "goal_both_halves",
+    "team_total_corners",
+    "total_corners_odd_even",
+    # ── Soccer — 1st half (settled via SofaScore through stats_api) ────────
+    "1st_half_both_teams_to_score",
+    "1st_half_draw_bet",
+    "1st_half_total_goals",
+    "1st_half_asian_total_goals",
+    "1st_half_team_total",
+    "1st_half_total_goals_odd_even",
+    "1st_half_total_corners",
+    "1st_half_team_total_corners",
+    # ── Soccer — 2nd half ──────────────────────────────────────────────────
+    "2nd_half_both_teams_to_score",
+    "2nd_half_draw_bet",
+    "2nd_half_total_goals",
+    "2nd_half_asian_total_goals",
+    "2nd_half_team_total",
+    "2nd_half_total_corners",
+    "2nd_half_team_total_corners",
 }
 
 # MLB period markets that should settle via stats_api market-check (Savant /gf)
@@ -283,9 +309,8 @@ _PERIOD_SETTLEABLE = {
     # Hockey — period
     "1st_period_moneyline", "1st_period_total_goals",
     "2nd_period_moneyline", "2nd_period_total_goals",
-    # Soccer — halftime (via ESPN summary endpoint)
-    "1st_half_both_teams_to_score", "1st_half_total_goals",
-    "1st_half_asian_total_goals", "1st_half_draw_bet",
+    # Soccer halftime markets were moved to _AUTO_SETTLEABLE → SofaScore via stats_api.
+    # ESPN period settlement for soccer is no longer used as primary source.
 }
 
 
@@ -946,10 +971,27 @@ async def _build_settlement(bet: dict) -> dict:
 
     line_value = _line_for_settlement(bet)
 
+    # For soccer team-specific markets (team_total, team_total_corners, etc.) the
+    # `player` field holds the target team name. Pass it as `team` so that
+    # soccer_sofascore_props can pick the right side.
+    _market = bet["market"]
+    _soccer_team_markets = {
+        "team_total", "team_total_corners",
+        "1st_half_team_total", "1st_half_team_total_corners",
+        "2nd_half_team_total", "2nd_half_team_total_corners",
+    }
+    if _market in _soccer_team_markets and bet.get("player") and bet.get("sport", "").lower() == "soccer":
+        query_team = bet["player"]
+
     # Normalise pick values that stats_api does not accept directly
     effective_pick = bet["pick"]
-    _market = bet["market"]
-    if _market == "both_teams_to_score":
+    if _market in ("both_teams_to_score",
+                   "1st_half_both_teams_to_score", "2nd_half_both_teams_to_score"):
+        if effective_pick.lower() in ("over", "yes"):
+            effective_pick = "yes"
+        elif effective_pick.lower() in ("under", "no"):
+            effective_pick = "no"
+    elif _market in ("goal_both_halves",):
         if effective_pick.lower() in ("over", "yes"):
             effective_pick = "yes"
         elif effective_pick.lower() in ("under", "no"):
