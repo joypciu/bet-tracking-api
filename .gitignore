@@ -21,3 +21,5 @@ build/
 
 # Temp / scratch
 *.tmp
+
+venv

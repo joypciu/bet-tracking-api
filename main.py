@@ -183,15 +183,21 @@ class CreateBetRequest(BaseModel):
                 self.pick = raw
                 if not self.team:
                     self.team = raw
-            elif self.market in ("spread", "puck_line", "run_line"):
-                m = re.match(r"^(?P<team>.+?)\s+(?P<spread>[+-]?\d+(?:\.\d+)?)$", raw)
-                if m:
-                    self.pick = m.group("team").strip()
-                    self.line = float(m.group("spread"))
+            elif _is_spread_market(self.market):
+                parsed = _parse_spread_selection(raw)
+                if parsed:
+                    self.pick, self.line = parsed[0], parsed[1]
                     if not self.team:
                         self.team = self.pick
             else:
                 self.pick = raw
+
+        if _is_spread_market(self.market) and self.pick:
+            parsed = _parse_spread_selection(str(self.pick))
+            if parsed:
+                self.pick, self.line = parsed[0], parsed[1]
+                if not self.team:
+                    self.team = self.pick
 
         _CORE = {"moneyline", "spread", "total", "puck_line", "run_line"}
         _is_specialty = self.market not in _CORE
@@ -291,7 +297,8 @@ _PERIOD_SETTLEABLE = {
     # Basketball — quarter & half
     "1st_quarter_moneyline", "1st_quarter_point_spread", "1st_quarter_total_points",
     "1st_quarter_team_total",
-    "1st_half_moneyline", "1st_half_total_points", "1st_half_team_total",
+    "1st_half_moneyline", "1st_half_point_spread", "1st_half_total_points",
+    "1st_half_team_total",
     "1st_half_home_team_total", "1st_half_away_team_total",
     "2nd_half_moneyline", "2nd_half_total_points", "2nd_half_team_total",
     "2nd_half_both_teams_to_score",
@@ -309,6 +316,40 @@ _PERIOD_SETTLEABLE = {
 
 def _is_prop_market(market: str) -> bool:
     return market.startswith("player_")
+
+
+_SPREAD_CORE_MARKETS = frozenset({"spread", "puck_line", "run_line"})
+_SPREAD_PICK_RE = re.compile(r"^(?P<team>.+?)\s+(?P<spread>[+-]?\d+(?:\.\d+)?)$")
+
+
+def _is_spread_market(market: str) -> bool:
+    m = (market or "").lower()
+    return m in _SPREAD_CORE_MARKETS or m.endswith("_point_spread") or m.endswith("_run_line")
+
+
+def _parse_spread_selection(raw: str) -> tuple[str, float] | None:
+    m = _SPREAD_PICK_RE.match(raw.strip())
+    if not m:
+        return None
+    return m.group("team").strip(), float(m.group("spread"))
+
+
+def _spread_pick_and_line_for_settlement(bet: dict) -> tuple[str, float | None]:
+    """Split combined spread picks like 'NYK +1.5' into team + numeric line."""
+    pick = str(bet.get("pick") or "").strip()
+    line = _line_for_settlement(bet)
+    if not _is_spread_market(bet.get("market", "")):
+        return pick, line
+
+    for raw in (pick, str(bet.get("selection_line") or "").strip()):
+        if not raw:
+            continue
+        parsed = _parse_spread_selection(raw)
+        if parsed:
+            team_pick, spread_line = parsed
+            return team_pick, spread_line
+
+    return pick, line
 
 
 def _line_for_settlement(bet: dict) -> float | None:
@@ -450,8 +491,8 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
     import httpx as _httpx
 
     market   = (bet.get("market") or "").lower()
-    pick_raw = (bet.get("pick")   or "").lower()
-    line_val = _line_for_settlement(bet)
+    team_pick, line_val = _spread_pick_and_line_for_settlement(bet)
+    pick_raw = team_pick.lower()
     sport    = (bet.get("sport")  or "").lower()
 
     comp, league_path = await _espn_fetch_competition(bet)
@@ -510,18 +551,30 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
 
     home_name = (home_comp.get("team", {}) or {}).get("displayName", "home")
     away_name = (away_comp.get("team", {}) or {}).get("displayName", "away")
+    home_abbr = ((home_comp.get("team", {}) or {}).get("abbreviation") or "").lower()
+    away_abbr = ((away_comp.get("team", {}) or {}).get("abbreviation") or "").lower()
+    bet_home = (bet.get("home_team") or "").lower()
+    bet_away = (bet.get("away_team") or "").lower()
+
+    def _pick_side_matches(side_name: str, side_abbr: str, side_bet: str) -> bool:
+        return (
+            pick_raw == side_abbr
+            or pick_raw in side_name
+            or side_name in pick_raw
+            or (side_bet and (pick_raw in side_bet or side_bet in pick_raw))
+        )
 
     # Resolve pick side
     if pick_raw == "home":
         pick_scores, opp_scores = home_scores, away_scores
     elif pick_raw == "away":
         pick_scores, opp_scores = away_scores, home_scores
+    elif _pick_side_matches(home_name.lower(), home_abbr, bet_home):
+        pick_scores, opp_scores = home_scores, away_scores
+    elif _pick_side_matches(away_name.lower(), away_abbr, bet_away):
+        pick_scores, opp_scores = away_scores, home_scores
     else:
-        hn = home_name.lower(); an = away_name.lower()
-        if pick_raw in hn or hn in pick_raw:
-            pick_scores, opp_scores = home_scores, away_scores
-        else:
-            pick_scores, opp_scores = away_scores, home_scores
+        pick_scores, opp_scores = away_scores, home_scores
 
     def _sum(scores: dict, periods: list[int]) -> float:
         return sum(scores.get(p, 0.0) for p in periods)
@@ -579,6 +632,11 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
         total = _sum(home_scores, [1, 2]) + _sum(away_scores, [1, 2])
         period_det = {"first_half_total": total}
         outcome = _total(total, float(line_val), pick_raw)
+
+    elif market == "1st_half_point_spread" and line_val is not None:
+        ps, os = _sum(pick_scores, [1, 2]), _sum(opp_scores, [1, 2])
+        period_det = {"pick_1h": ps, "opp_1h": os}
+        outcome = _spread(ps, os, float(line_val))
 
     elif market in ("1st_half_team_total", "1st_half_home_team_total", "1st_half_away_team_total") and line_val is not None:
         ps = _sum(pick_scores, [1, 2])
@@ -1045,12 +1103,12 @@ async def _build_settlement(bet: dict) -> dict:
                 "score": None, "pricing": None,
                 "note": "Cannot locate game — provide date + team name or event_id."}
 
-    line_value = _line_for_settlement(bet)
+    _market = bet["market"]
+    effective_pick, line_value = _spread_pick_and_line_for_settlement(bet)
 
     # Normalise pick values that stats_api does not accept directly
-    effective_pick = bet["pick"]
-    _market = bet["market"]
     if _market == "both_teams_to_score":
+        effective_pick = bet["pick"]
         if effective_pick.lower() in ("over", "yes"):
             effective_pick = "yes"
         elif effective_pick.lower() in ("under", "no"):
@@ -1419,7 +1477,8 @@ async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
     return JSONResponse({
         "auto_settleable": [
             "player_points", "player_rebounds", "player_assists", "player_threes",
-            "player_made_threes", "player_rebounds_assists", "player_points_rebounds_assists",
+            "player_made_threes", "player_rebounds_assists", "player_points_assists",
+            "player_points_rebounds_assists",
             "player_steals", "player_blocks", "player_turnovers", "player_minutes",
             "player_fg_made", "player_ft_made", "player_goals", "player_saves",
             "player_yellow_cards", "player_goals_hockey", "player_assists_hockey",
