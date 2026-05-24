@@ -262,6 +262,11 @@ _AUTO_SETTLEABLE = {
     "goal_both_halves",
     "team_total_corners",
     "total_corners_odd_even",
+    # ── Soccer — scorer / card markets (pick = player name) ────────────────
+    "anytime_goal_scorer",
+    "first_goal_scorer",
+    "last_goal_scorer",
+    "anytime_card_receiver",
     # ── Soccer — 1st half (settled via SofaScore through stats_api) ────────
     "1st_half_both_teams_to_score",
     "1st_half_draw_bet",
@@ -931,8 +936,10 @@ async def _build_settlement(bet: dict) -> dict:
 
     market = bet.get("market")
     sport = (bet.get("sport") or "").lower()
-    use_espn_period = market in _PERIOD_SETTLEABLE and not (
-        sport == "baseball" and market in _MLB_MARKETCHECK_ROUTED
+    use_espn_period = (
+        market in _PERIOD_SETTLEABLE
+        and sport != "soccer"   # soccer period markets route to SofaScore via _AUTO_SETTLEABLE
+        and not (sport == "baseball" and market in _MLB_MARKETCHECK_ROUTED)
     )
 
     if use_espn_period:
