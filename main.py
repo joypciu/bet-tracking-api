@@ -334,6 +334,25 @@ def _parse_spread_selection(raw: str) -> tuple[str, float] | None:
     return m.group("team").strip(), float(m.group("spread"))
 
 
+def _match_team_pick(team_pick: str, team_name: str) -> bool:
+    tp = team_pick.strip().lower()
+    tn = team_name.strip().lower()
+    if tp == tn or tp in tn or tn in tp:
+        return True
+    words = tn.split()
+    initials = "".join(w[0] for w in words if w)
+    return tp == initials
+
+
+def _resolve_spread_team_pick(team_pick: str, bet: dict) -> str:
+    """Map abbrevs like NYK to the full home/away team name on the bet."""
+    for field in ("home_team", "away_team", "team"):
+        name = bet.get(field)
+        if name and _match_team_pick(team_pick, name):
+            return name
+    return team_pick
+
+
 def _spread_pick_and_line_for_settlement(bet: dict) -> tuple[str, float | None]:
     """Split combined spread picks like 'NYK +1.5' into team + numeric line."""
     pick = str(bet.get("pick") or "").strip()
@@ -347,7 +366,7 @@ def _spread_pick_and_line_for_settlement(bet: dict) -> tuple[str, float | None]:
         parsed = _parse_spread_selection(raw)
         if parsed:
             team_pick, spread_line = parsed
-            return team_pick, spread_line
+            return _resolve_spread_team_pick(team_pick, bet), spread_line
 
     return pick, line
 
