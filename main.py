@@ -5,7 +5,8 @@ Standalone FastAPI service for bet + user tracking.
 Source of truth for all bets and users — the Cache API proxies to this service.
 
 Port: 5002 (VPS-internal; not exposed via Nginx by default)
-Auth: Bearer token via BET_API_TOKEN env var
+Auth: Cookie JWT (tracking_auth_token) for browser sessions;
+      Bearer token (BET_API_TOKEN) for service/script access.
 DB:   bets.db (SQLite, WAL mode) via BET_DB_PATH env var
 """
 
@@ -18,33 +19,20 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
+import httpx
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, Body
+from fastapi import Depends, FastAPI, HTTPException, Query, Body, Request
 from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 load_dotenv()
 
 import bet_tracking
 import sports_bridge
-
-# ---------------------------------------------------------------------------
-# Auth
-# ---------------------------------------------------------------------------
-
-_TOKEN = os.getenv("BET_API_TOKEN", "").strip()
-_security = HTTPBearer(auto_error=False)
-
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(_security)) -> str:
-    if not _TOKEN:
-        return "no-auth"
-    if credentials is None or credentials.credentials != _TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid or missing token")
-    return credentials.credentials
+from auth import require_auth, router as auth_router
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +52,25 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.include_router(auth_router)
+
+# ---------------------------------------------------------------------------
+# CORS
+# ---------------------------------------------------------------------------
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://tracking.keepbetting.co",
+        "https://tracking.eternitylabs.co",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------------------------------------------------------------------------
 # CLV math helpers
@@ -1540,13 +1547,22 @@ async def health():
 
 @app.post("/bets", tags=["bets"])
 async def create_bet(
-    body:  CreateBetRequest = Body(...),
-    token: str              = Depends(verify_token),
+    body:      CreateBetRequest = Body(...),
+    auth_user: Optional[dict]   = Depends(require_auth),
 ) -> JSONResponse:
+    # Cookie auth  → always use JWT email, ignore body.email
+    # Bearer auth  → use body.email (service/script callers supply it)
+    if auth_user and auth_user.get("auth_type") == "cookie":
+        resolved_email = auth_user.get("email")
+    else:
+        resolved_email = body.email
+
     user_id: Optional[str] = None
-    if body.email:
-        user = await run_in_threadpool(bet_tracking.create_or_get_user, body.email)
-        user_id = user["user_id"]
+    if resolved_email:
+        db_user = await run_in_threadpool(
+            bet_tracking.create_or_get_user, resolved_email
+        )
+        user_id = db_user["user_id"]
 
     nvig_at_placement: Optional[float] = None
     if body.counterpart_odds is not None and body.odds is not None:
@@ -1581,15 +1597,26 @@ async def list_bets(
     date_to:   Optional[str] = Query(None),
     limit:     int           = Query(50, ge=1, le=200),
     offset:    int           = Query(0,  ge=0),
-    token:     str           = Depends(verify_token),
+    auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
+    # Cookie auth  → always scope to JWT email, ignore ?email= param
+    # Bearer auth  → use ?email= query param if provided
+    if auth_user and auth_user.get("auth_type") == "cookie":
+        resolved_email = auth_user.get("email")
+    else:
+        resolved_email = email
+
     user_id: Optional[str] = None
-    if email:
-        user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
-        if not user:
-            return JSONResponse({"total": 0, "returned": 0, "offset": offset,
-                                 "limit": limit, "filters": {"email": email}, "bets": []})
-        user_id = user["user_id"]
+    if resolved_email:
+        db_user = await run_in_threadpool(
+            bet_tracking.get_user_by_email, resolved_email
+        )
+        if not db_user:
+            return JSONResponse({
+                "total": 0, "returned": 0, "offset": offset,
+                "limit": limit, "filters": {"email": resolved_email}, "bets": [],
+            })
+        user_id = db_user["user_id"]
 
     bets, total = await run_in_threadpool(
         bet_tracking.list_bets,
@@ -1599,35 +1626,71 @@ async def list_bets(
     )
     return JSONResponse({
         "total": total, "returned": len(bets), "offset": offset, "limit": limit,
-        "filters": {"status": status, "sport": sport, "market": market,
-                    "player": player, "email": email, "date_from": date_from, "date_to": date_to},
+        "filters": {
+            "status": status, "sport": sport, "market": market,
+            "player": player, "email": resolved_email,
+            "date_from": date_from, "date_to": date_to,
+        },
         "bets": [_bet_response(b, _stored_settlement(b)) for b in bets],
     })
 
 
 @app.get("/bets/summary", tags=["bets"])
 async def bets_summary(
-    email: Optional[str] = Query(None),
-    token: str           = Depends(verify_token),
+    email:     Optional[str] = Query(None),
+    auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
+    # Cookie auth  → always scope to JWT email
+    # Bearer auth  → use ?email= query param if provided
+    if auth_user and auth_user.get("auth_type") == "cookie":
+        resolved_email = auth_user.get("email")
+    else:
+        resolved_email = email
+
     user_id: str | None = None
-    if email:
-        user = await run_in_threadpool(bet_tracking.get_user_by_email, email.strip().lower())
-        if not user:
-            raise HTTPException(status_code=404, detail=f"No user found for email '{email}'")
-        user_id = user["user_id"]
+    if resolved_email:
+        db_user = await run_in_threadpool(
+            bet_tracking.get_user_by_email, resolved_email.strip().lower()
+        )
+        if not db_user:
+            raise HTTPException(
+                status_code=404, detail=f"No user found for email '{resolved_email}'"
+            )
+        user_id = db_user["user_id"]
     summary = await run_in_threadpool(bet_tracking.get_summary, user_id)
     return JSONResponse(summary)
 
 
 @app.get("/bets/analytics", tags=["bets"])
-async def bets_analytics(token: str = Depends(verify_token)) -> JSONResponse:
+async def bets_analytics(
+    email:     Optional[str] = Query(None),
+    auth_user: Optional[dict] = Depends(require_auth),
+) -> JSONResponse:
+    # Cookie auth  → always scope to JWT email
+    # Bearer auth  → use ?email= query param if provided
+    if auth_user and auth_user.get("auth_type") == "cookie":
+        resolved_email = auth_user.get("email")
+    else:
+        resolved_email = email
+
+    if resolved_email:
+        db_user = await run_in_threadpool(
+            bet_tracking.get_user_by_email, resolved_email.strip().lower()
+        )
+        if db_user:
+            analytics = await run_in_threadpool(
+                bet_tracking.get_user_analytics, db_user["user_id"]
+            )
+            return JSONResponse({
+                "user": {"user_id": db_user["user_id"], "email": db_user["email"]},
+                **analytics,
+            })
     analytics = await run_in_threadpool(bet_tracking.get_analytics)
     return JSONResponse(analytics)
 
 
 # @app.get("/bets/prop-markets", tags=["bets"])
-# async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
+# async def bets_prop_markets(user: Optional[dict] = Depends(require_auth)) -> JSONResponse:
 #     return JSONResponse({
 #         "auto_settleable": [
 #             "player_points", "player_rebounds", "player_assists", "player_threes",
@@ -1684,7 +1747,7 @@ async def bets_analytics(token: str = Depends(verify_token)) -> JSONResponse:
 
 
 @app.get("/bets/prop-markets", tags=["bets"])
-async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
+async def bets_prop_markets(user: Optional[dict] = Depends(require_auth)) -> JSONResponse:
     return JSONResponse({
         "auto_settleable": [
             "player_points", "player_rebounds", "player_assists", "player_threes",
@@ -1806,7 +1869,7 @@ async def bets_prop_markets(token: str = Depends(verify_token)) -> JSONResponse:
 @app.get("/bets/{bet_id}", tags=["bets"])
 async def get_bet(
     bet_id: str,
-    token:  str = Depends(verify_token),
+    user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
     bet = await run_in_threadpool(bet_tracking.get_bet, bet_id)
     if bet is None:
@@ -1826,7 +1889,7 @@ async def get_bet(
 @app.post("/bets/{bet_id}/settle", tags=["bets"])
 async def settle_bet(
     bet_id: str,
-    token:  str = Depends(verify_token),
+    user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
     bet = await run_in_threadpool(bet_tracking.get_bet, bet_id)
     if bet is None:
@@ -1854,26 +1917,41 @@ async def settle_bet(
 
 
 class BulkSettleRequest(BaseModel):
-    email: Optional[str] = Field(None, description="User email / Gmail address")
+    email:    Optional[str] = Field(None, description="User email / Gmail address")
+    gmail_id: Optional[str] = Field(None, description="Alias for email (backward compat)")
 
     @model_validator(mode="after")
     def normalize(self) -> "BulkSettleRequest":
-        if not self.email:
-            raise ValueError("email is required")
-        self.email = self.email.strip().lower()
+        if not self.email and self.gmail_id:
+            self.email = self.gmail_id
+        if self.email:
+            self.email = self.email.strip().lower()
         return self
 
 
 @app.post("/bets/settle-pending", tags=["bets"])
 async def settle_pending_bets_for_user(
-    body: BulkSettleRequest = Body(...),
-    token: str = Depends(verify_token),
+    body:      BulkSettleRequest = Body(...),
+    auth_user: Optional[dict]    = Depends(require_auth),
 ) -> JSONResponse:
-    user = await run_in_threadpool(bet_tracking.get_user_by_email, body.email)
-    if not user:
-        raise HTTPException(status_code=404, detail=f"No user found for email '{body.email}'")
+    # Cookie auth  → always use JWT email, ignore body.email
+    # Bearer auth  → use body.email (service/script callers supply it)
+    if auth_user and auth_user.get("auth_type") == "cookie":
+        resolved_email = auth_user.get("email")
+    else:
+        resolved_email = body.email
 
-    user_id = user["user_id"]
+    if not resolved_email:
+        raise HTTPException(
+            status_code=400, detail="email is required (provide in body or log in)"
+        )
+    db_user = await run_in_threadpool(bet_tracking.get_user_by_email, resolved_email)
+    if not db_user:
+        raise HTTPException(
+            status_code=404, detail=f"No user found for email '{resolved_email}'"
+        )
+
+    user_id = db_user["user_id"]
     pending_bets, _ = await run_in_threadpool(
         bet_tracking.list_bets,
         status="pending",
@@ -1947,25 +2025,11 @@ class ManualSettleRequest(BaseModel):
         return norm
 
 
-class BulkSettleRequest(BaseModel):
-    email: Optional[str] = Field(None, description="User email / Gmail address")
-    gmail_id: Optional[str] = Field(None, description="Alias for email / Gmail address")
-
-    @model_validator(mode="after")
-    def normalize(self) -> "BulkSettleRequest":
-        if not self.email and self.gmail_id:
-            self.email = self.gmail_id
-        if not self.email:
-            raise ValueError("email or gmail_id is required")
-        self.email = self.email.strip().lower()
-        return self
-
-
 @app.patch("/bets/{bet_id}", tags=["bets"])
 async def manual_settle_bet(
     bet_id: str,
     body:   ManualSettleRequest = Body(...),
-    token:  str                 = Depends(verify_token),
+    user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
     """Manually set the outcome of any pending bet."""
     bet = await run_in_threadpool(bet_tracking.get_bet, bet_id)
@@ -1998,7 +2062,7 @@ async def manual_settle_bet(
 @app.delete("/bets/{bet_id}", tags=["bets"])
 async def delete_bet(
     bet_id: str,
-    token:  str = Depends(verify_token),
+    user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
     deleted = await run_in_threadpool(bet_tracking.delete_bet, bet_id)
     if not deleted:
@@ -2014,7 +2078,7 @@ async def delete_bet(
 async def list_users(
     limit:  int = Query(50, ge=1, le=200),
     offset: int = Query(0,  ge=0),
-    token:  str = Depends(verify_token),
+    user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
     users, total = await run_in_threadpool(bet_tracking.list_users, limit=limit, offset=offset)
     return JSONResponse({"total": total, "returned": len(users),
@@ -2031,20 +2095,20 @@ async def user_bets(
     date_to:   Optional[str] = Query(None),
     limit:     int           = Query(50, ge=1, le=200),
     offset:    int           = Query(0,  ge=0),
-    token:     str           = Depends(verify_token),
+    auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
-    user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
-    if not user:
+    db_user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
+    if not db_user:
         raise HTTPException(status_code=404, detail=f"No user found for email '{email}'")
     bets, total = await run_in_threadpool(
         bet_tracking.list_bets,
         status=status, sport=sport, market=market,
         date_from=date_from, date_to=date_to,
-        user_id=user["user_id"], limit=limit, offset=offset,
+        user_id=db_user["user_id"], limit=limit, offset=offset,
     )
     return JSONResponse({
-        "user": {"user_id": user["user_id"], "email": user["email"],
-                 "created_at": user["created_at"]},
+        "user": {"user_id": db_user["user_id"], "email": db_user["email"],
+                 "created_at": db_user["created_at"]},
         "total": total, "returned": len(bets), "offset": offset, "limit": limit,
         "bets": [_bet_response(b) for b in bets],
     })
@@ -2052,26 +2116,32 @@ async def user_bets(
 
 @app.get("/users/{email}/stats", tags=["users"])
 async def user_stats(
-    email: str,
-    token: str = Depends(verify_token),
+    email:     str,
+    auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
-    user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
-    if not user:
+    db_user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
+    if not db_user:
         raise HTTPException(status_code=404, detail=f"No user found for email '{email}'")
-    summary = await run_in_threadpool(bet_tracking.get_user_summary, user["user_id"])
-    return JSONResponse({"user": {"user_id": user["user_id"], "email": user["email"]}, **summary})
+    summary = await run_in_threadpool(bet_tracking.get_user_summary, db_user["user_id"])
+    return JSONResponse({
+        "user": {"user_id": db_user["user_id"], "email": db_user["email"]},
+        **summary,
+    })
 
 
 @app.get("/users/{email}/analytics", tags=["users"])
 async def user_analytics(
-    email: str,
-    token: str = Depends(verify_token),
+    email:     str,
+    auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
-    user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
-    if not user:
+    db_user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
+    if not db_user:
         raise HTTPException(status_code=404, detail=f"No user found for email '{email}'")
-    analytics = await run_in_threadpool(bet_tracking.get_user_analytics, user["user_id"])
-    return JSONResponse({"user": {"user_id": user["user_id"], "email": user["email"]}, **analytics})
+    analytics = await run_in_threadpool(bet_tracking.get_user_analytics, db_user["user_id"])
+    return JSONResponse({
+        "user": {"user_id": db_user["user_id"], "email": db_user["email"]},
+        **analytics,
+    })
 
 
 # ---------------------------------------------------------------------------
