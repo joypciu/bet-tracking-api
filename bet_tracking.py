@@ -115,6 +115,15 @@ def init_db() -> None:
         for col in ("player_stat_value", "stat_name"):
             if col not in cols:
                 con.execute(f"ALTER TABLE bets ADD COLUMN {col} TEXT")
+        for col, typ in [
+            ("counterpart_odds",  "INTEGER"),
+            ("nvig_at_placement", "REAL"),
+            ("book_clv",          "REAL"),
+            ("nvig_clv",          "REAL"),
+            ("clv_calculated_at", "TEXT"),
+        ]:
+            if col not in cols:
+                con.execute(f"ALTER TABLE bets ADD COLUMN {col} {typ}")
         con.execute("CREATE INDEX IF NOT EXISTS idx_bets_player  ON bets(player)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_bets_user_id ON bets(user_id)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_bets_book    ON bets(book)")
@@ -188,25 +197,27 @@ def list_users(limit: int = 50, offset: int = 0) -> tuple[list[dict[str, Any]], 
 # ---------------------------------------------------------------------------
 
 def create_bet(
-    market:         str,
-    pick:           str | None       = None,
-    user_id:        str | None       = None,
-    sport:          str | None       = None,
-    league:         str | None       = None,
-    date:           str | None       = None,
-    event:          str | None       = None,
-    event_datetime: str | None       = None,
-    event_id:       str | None       = None,
-    team:           str | None       = None,
-    home_team:      str | None       = None,
-    away_team:      str | None       = None,
-    player:         str | None       = None,
-    selection_line: str | None       = None,
-    line:           float | None     = None,
-    odds:           int | None       = None,
-    stake:          float | None     = None,
-    notes:          str | None       = None,
-    book:           str | None       = None,
+    market:            str,
+    pick:              str | None       = None,
+    user_id:           str | None       = None,
+    sport:             str | None       = None,
+    league:            str | None       = None,
+    date:              str | None       = None,
+    event:             str | None       = None,
+    event_datetime:    str | None       = None,
+    event_id:          str | None       = None,
+    team:              str | None       = None,
+    home_team:         str | None       = None,
+    away_team:         str | None       = None,
+    player:            str | None       = None,
+    selection_line:    str | None       = None,
+    line:              float | None     = None,
+    odds:              int | None       = None,
+    stake:             float | None     = None,
+    notes:             str | None       = None,
+    book:              str | None       = None,
+    counterpart_odds:  int | None       = None,
+    nvig_at_placement: float | None     = None,
 ) -> dict[str, Any]:
     bet_id      = str(uuid.uuid4())
     created_at  = datetime.now(timezone.utc).isoformat()
@@ -217,12 +228,14 @@ def create_bet(
             INSERT INTO bets
                 (bet_id, created_at, user_id, sport, league, date, event, event_datetime,
                  event_id, team, home_team, away_team, player, market, pick,
-                 selection_line, line, odds, stake, notes, book)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 selection_line, line, odds, stake, notes, book,
+                 counterpart_odds, nvig_at_placement)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (bet_id, created_at, user_id, sport, league, date, event, event_datetime,
              event_id, team, home_team, away_team, player, market, pick_stored,
-             selection_line, line, odds, stake, notes, book),
+             selection_line, line, odds, stake, notes, book,
+             counterpart_odds, nvig_at_placement),
         )
     return get_bet(bet_id)  # type: ignore[return-value]
 
@@ -311,6 +324,23 @@ def settle_bet(
              player_stat_value, stat_name, bet_id),
         )
         return cur.rowcount > 0
+
+
+def update_bet_clv(
+    bet_id:   str,
+    book_clv: float | None,
+    nvig_clv: float | None,
+) -> None:
+    clv_calculated_at = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        con.execute(
+            """
+            UPDATE bets
+            SET book_clv = ?, nvig_clv = ?, clv_calculated_at = ?
+            WHERE bet_id = ?
+            """,
+            (book_clv, nvig_clv, clv_calculated_at, bet_id),
+        )
 
 
 def void_bet(bet_id: str) -> bool:
