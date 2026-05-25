@@ -1190,7 +1190,7 @@ async def _build_settlement(bet: dict) -> dict:
         if result:
             return result
 
-    if bet.get("market") not in _AUTO_SETTLEABLE or not bet.get("pick"):
+    if market not in _AUTO_SETTLEABLE or not bet.get("pick"):
         return {
             "outcome": "not_settleable", "settled": False, "source": None,
             "score": None, "pricing": None, "espn_limitation": True,
@@ -1213,13 +1213,12 @@ async def _build_settlement(bet: dict) -> dict:
                 "score": None, "pricing": None,
                 "note": "Cannot locate game — provide date + team name or event_id."}
 
-    _market = bet["market"]
+    _market = market
     effective_pick, line_value = _spread_pick_and_line_for_settlement(bet)
 
     # For soccer team-specific markets (team_total, team_total_corners, etc.) the
     # `player` field holds the target team name. Pass it as `team` so that
     # soccer_sofascore_props can pick the right side.
-    _market = bet["market"]
     _soccer_team_markets = {
         "team_total", "team_total_corners",
         "1st_half_team_total", "1st_half_team_total_corners",
