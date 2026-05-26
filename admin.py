@@ -32,8 +32,8 @@ _ALGORITHM          = "HS256"
 _ADMIN_TOKEN_EXPIRE = 8   # hours
 
 # Hardcoded admin credentials (single admin account)
-_ADMIN_EMAIL    = "admin.eternitylabs@gmail.com"
-_ADMIN_PASSWORD = "Admin123*#"
+_ADMIN_EMAIL    = os.getenv("ADMIN_EMAIL")
+_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
