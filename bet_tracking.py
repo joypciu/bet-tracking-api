@@ -36,8 +36,10 @@ stat_name         TEXT
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import secrets
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -119,6 +121,22 @@ def init_db() -> None:
         con.execute("CREATE INDEX IF NOT EXISTS idx_bets_user_id ON bets(user_id)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_bets_book    ON bets(book)")
 
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS api_users (
+                user_id        TEXT PRIMARY KEY,
+                name           TEXT NOT NULL,
+                email          TEXT UNIQUE NOT NULL,
+                organization   TEXT,
+                notes          TEXT,
+                api_key_hash   TEXT NOT NULL,
+                api_key_prefix TEXT NOT NULL,
+                is_active      INTEGER NOT NULL DEFAULT 1,
+                created_at     TEXT NOT NULL
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_api_users_email    ON api_users(email)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_api_users_key_hash ON api_users(api_key_hash)")
+
 
 # ---------------------------------------------------------------------------
 # User management
@@ -181,6 +199,125 @@ def list_users(limit: int = 50, offset: int = 0) -> tuple[list[dict[str, Any]], 
             (limit, offset),
         ).fetchall()
     return [dict(r) for r in rows], total
+
+
+# ---------------------------------------------------------------------------
+# API user management (api_key-based external users)
+# ---------------------------------------------------------------------------
+
+def _generate_api_key() -> tuple[str, str, str]:
+    """Return (full_key, sha256_hash, display_prefix)."""
+    raw    = "btk_" + secrets.token_urlsafe(32)
+    hashed = hashlib.sha256(raw.encode()).hexdigest()
+    prefix = raw[:16] + "..."
+    return raw, hashed, prefix
+
+
+def create_api_user(
+    name:         str,
+    email:        str,
+    organization: str | None = None,
+    notes:        str | None = None,
+) -> dict[str, Any]:
+    """Create a new API user and return the record including the plaintext key (shown once)."""
+    normalised = validate_email(email)
+    user_id    = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+    raw_key, key_hash, key_prefix = _generate_api_key()
+    with _conn() as con:
+        con.execute(
+            """
+            INSERT INTO api_users
+                (user_id, name, email, organization, notes,
+                 api_key_hash, api_key_prefix, is_active, created_at)
+            VALUES (?,?,?,?,?,?,?,1,?)
+            """,
+            (user_id, name.strip(), normalised, organization, notes,
+             key_hash, key_prefix, created_at),
+        )
+    return {
+        "user_id":      user_id,
+        "name":         name.strip(),
+        "email":        normalised,
+        "organization": organization,
+        "notes":        notes,
+        "api_key":      raw_key,      # plaintext — returned once only
+        "api_key_prefix": key_prefix,
+        "is_active":    True,
+        "created_at":   created_at,
+    }
+
+
+def list_api_users() -> list[dict[str, Any]]:
+    with _conn() as con:
+        rows = con.execute(
+            """
+            SELECT user_id, name, email, organization, notes,
+                   api_key_prefix, is_active, created_at
+            FROM api_users
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_api_user_by_id(user_id: str) -> dict[str, Any] | None:
+    with _conn() as con:
+        row = con.execute(
+            "SELECT user_id, name, email, organization, notes, "
+            "api_key_prefix, is_active, created_at "
+            "FROM api_users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return _row_to_dict(row)
+
+
+def get_api_user_by_key_hash(key_hash: str) -> dict[str, Any] | None:
+    with _conn() as con:
+        row = con.execute(
+            "SELECT user_id, name, email, organization, api_key_prefix, is_active "
+            "FROM api_users WHERE api_key_hash = ?",
+            (key_hash,),
+        ).fetchone()
+    return _row_to_dict(row)
+
+
+def set_api_user_active(user_id: str, active: bool) -> bool:
+    with _conn() as con:
+        cur = con.execute(
+            "UPDATE api_users SET is_active = ? WHERE user_id = ?",
+            (1 if active else 0, user_id),
+        )
+    return cur.rowcount > 0
+
+
+def delete_api_user(user_id: str) -> bool:
+    with _conn() as con:
+        cur = con.execute("DELETE FROM api_users WHERE user_id = ?", (user_id,))
+    return cur.rowcount > 0
+
+
+def regenerate_api_key(user_id: str) -> dict[str, Any] | None:
+    """Replace the API key for user_id. Returns record with plaintext key (once only)."""
+    raw_key, key_hash, key_prefix = _generate_api_key()
+    with _conn() as con:
+        cur = con.execute(
+            "UPDATE api_users SET api_key_hash = ?, api_key_prefix = ? WHERE user_id = ?",
+            (key_hash, key_prefix, user_id),
+        )
+        if cur.rowcount == 0:
+            return None
+        row = con.execute(
+            "SELECT user_id, name, email, organization, notes, is_active, created_at "
+            "FROM api_users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    if not row:
+        return None
+    rec = dict(row)
+    rec["api_key"]        = raw_key
+    rec["api_key_prefix"] = key_prefix
+    return rec
 
 
 # ---------------------------------------------------------------------------

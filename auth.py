@@ -10,6 +10,8 @@ Auth is ALWAYS required regardless of origin or hostname.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import os
 from datetime import datetime, timedelta
 
@@ -19,6 +21,8 @@ from dotenv import load_dotenv
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+import bet_tracking
 
 load_dotenv()
 
@@ -49,29 +53,23 @@ async def require_auth(
     credentials: HTTPAuthorizationCredentials = Depends(_bearer),
 ):
     """
-    Dual-mode auth dependency. Always enforced — no domain bypass.
+    Triple-mode auth dependency. Always enforced — no domain bypass.
 
     Priority:
-      1. tracking_auth_token cookie (JWT) -- browser / user sessions
-      2. Authorization: Bearer <BET_API_TOKEN> -- service / script access
+      1. tracking_auth_token cookie (JWT)     -- browser / user sessions
+      2. X-API-Key header or Bearer btk_*     -- external API key users
+      3. Authorization: Bearer <BET_API_TOKEN> -- internal service access
 
-    Returns:
-      {"auth_type": "cookie", "email": ..., ...}  -- decoded JWT payload
-      {"auth_type": "bearer", "email": None}       -- valid Bearer token
-      Raises HTTP 401 if neither is present or valid.
+    Returns dict with auth_type and user info. Raises HTTP 401 if none match.
     """
     origin = request.headers.get("origin", "")
-    host = request.headers.get("host", "")
+    host   = request.headers.get("host", "")
 
     # --- 1. Try cookie JWT ---
     if tracking_auth_token and SECRET_KEY:
         try:
-            payload = jwt.decode(
-                tracking_auth_token, SECRET_KEY, algorithms=[ALGORITHM]
-            )
-            print("[AUTH] Cookie JWT: {} from {}".format(
-                payload.get("email"), origin or host
-            ))
+            payload = jwt.decode(tracking_auth_token, SECRET_KEY, algorithms=[ALGORITHM])
+            print("[AUTH] Cookie JWT: {} from {}".format(payload.get("email"), origin or host))
             return {"auth_type": "cookie", **payload}
         except jwt.ExpiredSignatureError:
             print("[AUTH] Cookie JWT expired")
@@ -80,12 +78,33 @@ async def require_auth(
             print("[AUTH] Cookie JWT invalid")
             raise HTTPException(status_code=401, detail="Invalid token")
 
-    # --- 2. Try Bearer token ---
+    # --- 2. Try API key (X-API-Key header or Bearer btk_*) ---
+    api_key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+    if not api_key and credentials:
+        raw = credentials.credentials
+        if raw.startswith("btk_"):
+            api_key = raw
+
+    if api_key:
+        key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+        api_user = await asyncio.to_thread(bet_tracking.get_api_user_by_key_hash, key_hash)
+        if api_user and api_user.get("is_active"):
+            print("[AUTH] API key user: {} from {}".format(api_user.get("email"), origin or host))
+            return {
+                "auth_type": "api_key",
+                "email":     api_user["email"],
+                "user_id":   api_user["user_id"],
+                "name":      api_user["name"],
+            }
+        print("[AUTH] Invalid or inactive API key from {}".format(origin or host))
+        raise HTTPException(status_code=401, detail="Invalid or inactive API key")
+
+    # --- 3. Try Bearer token (internal service) ---
     if credentials and _BET_API_TOKEN and credentials.credentials == _BET_API_TOKEN:
         print("[AUTH] Bearer token from {}".format(origin or host))
         return {"auth_type": "bearer", "email": None}
 
-    # --- 3. Nothing valid ---
+    # --- 4. Nothing valid ---
     print("[AUTH] No valid auth from {}".format(origin or host))
     raise HTTPException(status_code=401, detail="Authentication required")
 
