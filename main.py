@@ -33,6 +33,7 @@ load_dotenv()
 import bet_tracking
 import sports_bridge
 from auth import require_auth, router as auth_router
+from admin import router as admin_router
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +54,7 @@ app = FastAPI(
 )
 
 app.include_router(auth_router)
+app.include_router(admin_router)
 
 # ---------------------------------------------------------------------------
 # CORS
@@ -1551,7 +1553,7 @@ async def create_bet(
 ) -> JSONResponse:
     # Cookie auth  → always use JWT email, ignore body.email
     # Bearer auth  → use body.email (service/script callers supply it)
-    if auth_user and auth_user.get("auth_type") == "cookie":
+    if auth_user and auth_user.get("auth_type") in ("cookie", "api_key"):
         resolved_email = auth_user.get("email")
     else:
         resolved_email = body.email
@@ -1598,9 +1600,9 @@ async def list_bets(
     offset:    int           = Query(0,  ge=0),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
-    # Cookie auth  → always scope to JWT email, ignore ?email= param
-    # Bearer auth  → use ?email= query param if provided
-    if auth_user and auth_user.get("auth_type") == "cookie":
+    # Cookie / API key auth → always scope to token email, ignore ?email= param
+    # Bearer auth → use ?email= query param if provided
+    if auth_user and auth_user.get("auth_type") in ("cookie", "api_key"):
         resolved_email = auth_user.get("email")
     else:
         resolved_email = email
@@ -1639,9 +1641,9 @@ async def bets_summary(
     email:     Optional[str] = Query(None),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
-    # Cookie auth  → always scope to JWT email
-    # Bearer auth  → use ?email= query param if provided
-    if auth_user and auth_user.get("auth_type") == "cookie":
+    # Cookie / API key auth → always scope to token email
+    # Bearer auth → use ?email= query param if provided
+    if auth_user and auth_user.get("auth_type") in ("cookie", "api_key"):
         resolved_email = auth_user.get("email")
     else:
         resolved_email = email
@@ -1665,9 +1667,9 @@ async def bets_analytics(
     email:     Optional[str] = Query(None),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
-    # Cookie auth  → always scope to JWT email
-    # Bearer auth  → use ?email= query param if provided
-    if auth_user and auth_user.get("auth_type") == "cookie":
+    # Cookie / API key auth → always scope to token email
+    # Bearer auth → use ?email= query param if provided
+    if auth_user and auth_user.get("auth_type") in ("cookie", "api_key"):
         resolved_email = auth_user.get("email")
     else:
         resolved_email = email
@@ -1933,9 +1935,9 @@ async def settle_pending_bets_for_user(
     body:      BulkSettleRequest = Body(...),
     auth_user: Optional[dict]    = Depends(require_auth),
 ) -> JSONResponse:
-    # Cookie auth  → always use JWT email, ignore body.email
-    # Bearer auth  → use body.email (service/script callers supply it)
-    if auth_user and auth_user.get("auth_type") == "cookie":
+    # Cookie / API key auth → always use token email, ignore body.email
+    # Bearer auth → use body.email (service/script callers supply it)
+    if auth_user and auth_user.get("auth_type") in ("cookie", "api_key"):
         resolved_email = auth_user.get("email")
     else:
         resolved_email = body.email
