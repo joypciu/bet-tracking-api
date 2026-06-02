@@ -101,6 +101,10 @@ async def fetch_prop_check(
     return await _get("/stats/prop-check", params)
 
 
+async def fetch_odds_history(event_id: str) -> dict[str, Any]:
+    return await _get("/stats/game/odds-history", {"event_id": event_id})
+
+
 async def fetch_live(team: str | None = None) -> dict[str, Any]:
     params = {}
     if team:

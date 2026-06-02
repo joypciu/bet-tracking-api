@@ -12,6 +12,7 @@ DB:   bets.db (SQLite, WAL mode) via BET_DB_PATH env var
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from contextlib import asynccontextmanager
@@ -74,29 +75,67 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
+# CLV math helpers
+# ---------------------------------------------------------------------------
+
+def _american_to_decimal(american: int) -> float:
+    if american > 0:
+        return (american / 100) + 1.0
+    return (100 / abs(american)) + 1.0
+
+
+def _compute_nvig_ev(bet_odds: int, pick_odds: int, counterpart_odds: int) -> float | None:
+    """EV% of a bet using no-vig fair probability. All odds are American integers."""
+    try:
+        bet_dec   = _american_to_decimal(bet_odds)
+        pick_prob = 1.0 / _american_to_decimal(pick_odds)
+        ctr_prob  = 1.0 / _american_to_decimal(counterpart_odds)
+        total     = pick_prob + ctr_prob
+        if total <= 0:
+            return None
+        fair_prob = pick_prob / total
+        return round(fair_prob * bet_dec - 1.0, 4)
+    except (ZeroDivisionError, ValueError, TypeError):
+        return None
+
+
+def _compute_book_clv(bet_odds: int, closing_pick_odds: int) -> float | None:
+    """% gain vs closing raw odds (positive = you beat the closing line)."""
+    try:
+        bet_dec     = _american_to_decimal(bet_odds)
+        closing_dec = _american_to_decimal(closing_pick_odds)
+        if closing_dec <= 0:
+            return None
+        return round(bet_dec / closing_dec - 1.0, 4)
+    except (ZeroDivisionError, ValueError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Request model (mirrors cache-api CreateBetRequest exactly)
 # ---------------------------------------------------------------------------
 
 
 class CreateBetRequest(BaseModel):
-    market: str
-    pick: Optional[str] = Field(None)
-    sport: Optional[str] = Field(None)
-    date: Optional[str] = Field(None)
-    league: Optional[str] = Field(None)
-    event: Optional[str] = Field(None)
-    datetime: Optional[str] = Field(None)
-    player: Optional[str] = Field(None)
-    team: Optional[str] = Field(None)
-    home_team: Optional[str] = Field(None)
-    away_team: Optional[str] = Field(None)
-    event_id: Optional[str] = Field(None)
-    line: Optional[str | float] = Field(None)
-    odds: Optional[int] = Field(None)
-    stake: Optional[float] = Field(None)
-    notes: Optional[str] = Field(None)
-    email: Optional[str] = Field(None)
-    book: Optional[str] = Field(None)
+    market:     str
+    pick:       Optional[str]         = Field(None)
+    sport:      Optional[str]         = Field(None)
+    date:       Optional[str]         = Field(None)
+    league:     Optional[str]         = Field(None)
+    event:      Optional[str]         = Field(None)
+    datetime:   Optional[str]         = Field(None)
+    player:     Optional[str]         = Field(None)
+    team:       Optional[str]         = Field(None)
+    home_team:  Optional[str]         = Field(None)
+    away_team:  Optional[str]         = Field(None)
+    event_id:   Optional[str]         = Field(None)
+    line:       Optional[str | float] = Field(None)
+    odds:       Optional[int]         = Field(None)
+    stake:      Optional[float]       = Field(None)
+    notes:      Optional[str]         = Field(None)
+    email:            Optional[str]         = Field(None)
+    book:             Optional[str]         = Field(None)
+    counterpart_odds: Optional[int]         = Field(None, description="Other side's American odds at placement — enables nvig_at_placement EV calculation")
 
     _raw_line: Optional[str] = PrivateAttr(default=None)
 
@@ -105,20 +144,14 @@ class CreateBetRequest(BaseModel):
     def validate_market(cls, v: str) -> str:
         norm = re.sub(r"[^a-z0-9]+", "_", v.strip().lower()).strip("_")
         game_aliases = {
-            "moneyline": "moneyline",
-            "ml": "moneyline",
-            "spread": "spread",
-            "game_spread": "spread",
-            "point_spread": "spread",
-            "ats": "spread",
-            "puck_line": "puck_line",
-            "run_line": "run_line",
-            "total": "total",
-            "game_total": "total",
-            "ou": "total",
-            "o_u": "total",
-            "total_goals": "total_goals",
-            "total_runs": "total_runs",
+            "moneyline": "moneyline", "ml": "moneyline",
+            "spread": "spread", "game_spread": "spread",
+            "point_spread": "spread", "ats": "spread",
+            "puck_line": "puck_line", "run_line": "run_line",
+            "total": "total", "game_total": "total",
+            "ou": "total", "o_u": "total",
+            "total_points": "total",
+            "total_goals": "total_goals", "total_runs": "total_runs",
             "total_corners": "total_corners",
         }
         if norm in game_aliases:
@@ -476,9 +509,15 @@ def _is_prop_market(market: str) -> bool:
     return market.startswith("player_")
 
 
-_SPREAD_CORE_MARKETS = frozenset(
-    {"spread", "puck_line", "run_line", "set_handicap", "game_spread"}
-)
+def _normalize_settlement_market(market: str) -> str:
+    """Map upstream market names to stats_api settlement names."""
+    m = (market or "").strip().lower()
+    if m == "total_points":
+        return "total"
+    return m
+
+
+_SPREAD_CORE_MARKETS = frozenset({"spread", "puck_line", "run_line"})
 _SPREAD_PICK_RE = re.compile(r"^(?P<team>.+?)\s+(?P<spread>[+-]?\d+(?:\.\d+)?)$")
 
 
@@ -498,6 +537,25 @@ def _parse_spread_selection(raw: str) -> tuple[str, float] | None:
     return m.group("team").strip(), float(m.group("spread"))
 
 
+def _match_team_pick(team_pick: str, team_name: str) -> bool:
+    tp = team_pick.strip().lower()
+    tn = team_name.strip().lower()
+    if tp == tn or tp in tn or tn in tp:
+        return True
+    words = tn.split()
+    initials = "".join(w[0] for w in words if w)
+    return tp == initials
+
+
+def _resolve_spread_team_pick(team_pick: str, bet: dict) -> str:
+    """Map abbrevs like NYK to the full home/away team name on the bet."""
+    for field in ("home_team", "away_team", "team"):
+        name = bet.get(field)
+        if name and _match_team_pick(team_pick, name):
+            return name
+    return team_pick
+
+
 def _spread_pick_and_line_for_settlement(bet: dict) -> tuple[str, float | None]:
     """Split combined spread picks like 'NYK +1.5' into team + numeric line."""
     pick = str(bet.get("pick") or "").strip()
@@ -511,7 +569,7 @@ def _spread_pick_and_line_for_settlement(bet: dict) -> tuple[str, float | None]:
         parsed = _parse_spread_selection(raw)
         if parsed:
             team_pick, spread_line = parsed
-            return team_pick, spread_line
+            return _resolve_spread_team_pick(team_pick, bet), spread_line
 
     return pick, line
 
@@ -1355,7 +1413,7 @@ async def _build_settlement(bet: dict) -> dict:
     if _is_prop_market(bet.get("market", "")):
         return await _build_prop_settlement(bet)
 
-    market = bet.get("market")
+    market = _normalize_settlement_market(bet.get("market") or "")
     sport = (bet.get("sport") or "").lower()
     use_espn_period = (
         market in _PERIOD_SETTLEABLE
@@ -1382,7 +1440,7 @@ async def _build_settlement(bet: dict) -> dict:
         if result:
             return result
 
-    if bet.get("market") not in _AUTO_SETTLEABLE or not bet.get("pick"):
+    if market not in _AUTO_SETTLEABLE or not bet.get("pick"):
         return {
             "outcome": "not_settleable",
             "settled": False,
@@ -1420,13 +1478,12 @@ async def _build_settlement(bet: dict) -> dict:
             "note": "Cannot locate game — provide date + team name or event_id.",
         }
 
-    _market = bet["market"]
+    _market = market
     effective_pick, line_value = _spread_pick_and_line_for_settlement(bet)
 
     # For soccer team-specific markets (team_total, team_total_corners, etc.) the
     # `player` field holds the target team name. Pass it as `team` so that
     # soccer_sofascore_props can pick the right side.
-    _market = bet["market"]
     _soccer_team_markets = {
         "team_total",
         "team_total_corners",
@@ -1684,6 +1741,10 @@ def _bet_response(bet: dict, settlement: dict | None = None) -> dict:
         "book": bet.get("book"),
         "settled_at": bet.get("settled_at"),
         "settlement_source": bet.get("settlement_source"),
+        "nvig_at_placement": bet.get("nvig_at_placement"),
+        "book_clv":          bet.get("book_clv"),
+        "nvig_clv":          bet.get("nvig_clv"),
+        "clv_calculated_at": bet.get("clv_calculated_at"),
         "settlement": settlement,
     }
 
@@ -1702,6 +1763,85 @@ def _selection_line_for_storage(body: CreateBetRequest) -> str | None:
     if body.market == "moneyline" and body.pick:
         return body.pick
     return str(body.line)
+
+
+# ---------------------------------------------------------------------------
+# CLV background calculator
+# ---------------------------------------------------------------------------
+
+async def _calculate_clv_for_bet(bet_id: str) -> None:
+    """
+    Fetch closing odds from the historics API and write book_clv + nvig_clv.
+    Always fire-and-forget (never raises). Called after successful settlement.
+    """
+    try:
+        bet = await run_in_threadpool(bet_tracking.get_bet, bet_id)
+        if not bet:
+            return
+        event_id = bet.get("event_id")
+        bet_odds  = bet.get("odds")
+        if not event_id or not bet_odds:
+            return
+
+        try:
+            history_data = await sports_bridge.fetch_odds_history(event_id)
+        except Exception:
+            return
+
+        closing: dict = history_data.get("closing") or {}
+        if not closing:
+            return
+
+        # Resolve which closing odds field corresponds to this pick
+        pick_raw   = (bet.get("pick") or "").lower().strip()
+        pick_clean = re.sub(r"\s+[+-]?\d+\.?\d*$", "", pick_raw).strip()
+
+        pick_closing: int | None = None
+        ctr_closing:  int | None = None
+
+        if pick_clean == "over":
+            pick_closing = closing.get("over_odds")
+            ctr_closing  = closing.get("under_odds")
+        elif pick_clean == "under":
+            pick_closing = closing.get("under_odds")
+            ctr_closing  = closing.get("over_odds")
+        elif pick_clean == "home":
+            pick_closing = closing.get("home_ml")
+            ctr_closing  = closing.get("away_ml")
+        elif pick_clean == "away":
+            pick_closing = closing.get("away_ml")
+            ctr_closing  = closing.get("home_ml")
+        else:
+            home = (bet.get("home_team") or "").lower()
+            away = (bet.get("away_team") or "").lower()
+            if home and (pick_clean in home or home in pick_clean):
+                pick_closing = closing.get("home_ml")
+                ctr_closing  = closing.get("away_ml")
+            elif away and (pick_clean in away or away in pick_clean):
+                pick_closing = closing.get("away_ml")
+                ctr_closing  = closing.get("home_ml")
+
+        if pick_closing is None:
+            return
+
+        try:
+            pick_closing = int(pick_closing)
+        except (ValueError, TypeError):
+            return
+        if ctr_closing is not None:
+            try:
+                ctr_closing = int(ctr_closing)
+            except (ValueError, TypeError):
+                ctr_closing = None
+
+        book_clv = _compute_book_clv(bet_odds, pick_closing)
+        nvig_clv = (
+            _compute_nvig_ev(bet_odds, pick_closing, ctr_closing)
+            if ctr_closing is not None else None
+        )
+        await run_in_threadpool(bet_tracking.update_bet_clv, bet_id, book_clv, nvig_clv)
+    except Exception:
+        pass  # CLV is non-critical — must never crash settlement flow
 
 
 # ---------------------------------------------------------------------------
@@ -1749,6 +1889,10 @@ async def create_bet(
         )
         user_id = db_user["user_id"]
 
+    nvig_at_placement: Optional[float] = None
+    if body.counterpart_odds is not None and body.odds is not None:
+        nvig_at_placement = _compute_nvig_ev(body.odds, body.odds, body.counterpart_odds)
+
     bet = await run_in_threadpool(
         bet_tracking.create_bet,
         market=body.market,
@@ -1766,12 +1910,12 @@ async def create_bet(
         player=body.player,
         selection_line=_selection_line_for_storage(body),
         line=body.line if isinstance(body.line, (int, float)) else None,
-        odds=body.odds,
-        stake=body.stake,
-        notes=body.notes,
-        book=body.book,
+        odds=body.odds, stake=body.stake, notes=body.notes, book=body.book,
+        counterpart_odds=body.counterpart_odds, nvig_at_placement=nvig_at_placement,
     )
     settlement = await _build_settlement(bet)
+    if settlement.get("settled") and settlement.get("outcome") in {"win", "loss", "push"}:
+        asyncio.ensure_future(_calculate_clv_for_bet(bet["bet_id"]))
     return JSONResponse(status_code=201, content=_bet_response(bet, settlement))
 
 
@@ -1961,189 +2105,123 @@ async def bets_analytics(
 
 
 @app.get("/bets/prop-markets", tags=["bets"])
-async def bets_prop_markets(
-    user: Optional[dict] = Depends(require_auth),
-) -> JSONResponse:
-    return JSONResponse(
-        {
-            "auto_settleable": [
-                "player_points",
-                "player_rebounds",
-                "player_assists",
-                "player_threes",
-                "player_made_threes",
-                "player_rebounds_assists",
-                "player_points_assists",
-                "player_points_rebounds_assists",
-                "player_steals",
-                "player_blocks",
-                "player_turnovers",
-                "player_minutes",
-                "player_fg_made",
-                "player_ft_made",
-                "player_goals",
-                "player_saves",
-                "player_yellow_cards",
-                "player_goals_hockey",
-                "player_assists_hockey",
-                "player_hits",
-                "player_rbis",
-                "player_runs",
-                "player_home_runs",
-                "player_doubles",
-                "player_triples",
-                "player_bases",
-                "player_singles",
-                "player_hits_runs_rbis",
-                "player_runs_cricket",
-                "player_wickets_cricket",
-                "player_strikeouts",
-                "player_earned_runs",
-                "player_outs",
-                "1st_quarter_total_points",
-                "2nd_quarter_total_points",
-                "3rd_quarter_total_points",
-                "4th_quarter_total_points",
-                "1st_quarter_total_points_odd_even",
-                "2nd_quarter_total_points_odd_even",
-                "3rd_quarter_total_points_odd_even",
-                "1st_quarter_moneyline",
-                "2nd_quarter_moneyline",
-                "3rd_quarter_moneyline",
-                "4th_quarter_moneyline",
-                "1st_quarter_point_spread",
-                "2nd_quarter_point_spread",
-                "3rd_quarter_point_spread",
-                "4th_quarter_point_spread",
-                "1st_quarter_team_total",
-                "2nd_quarter_team_total",
-                "3rd_quarter_team_total",
-                "4th_quarter_team_total",
-                "1st_half_total_points",
-                "1st_half_total_points_odd_even",
-                "2nd_half_total_points_odd_even",
-                "1st_half_moneyline",
-                "1st_half_point_spread",
-                "1st_half_team_total",
-                "1st_quarter_player_points",
-                "2nd_quarter_player_points",
-                "3rd_quarter_player_points",
-                "4th_quarter_player_points",
-                "1st_half_player_points",
-                "2nd_half_player_points",
-                "total_points_odd_even",
-                "will_there_be_overtime",
-                "team_first_basket",
-                "first_basket",
-                "first_basket_including_ft",
-                # MMA
-                "go_the_distance",
-                "total_rounds",
-            ],
-            "auto_settleable_sources": {
-                "player_runs": "mlb_period_props",
-                "player_home_runs": "mlb_period_props",
-                "player_doubles": "mlb_period_props",
-                "player_triples": "mlb_period_props",
-                "player_bases": "mlb_period_props",
-                "player_singles": "mlb_period_props",
-                "player_hits_runs_rbis": "mlb_period_props",
-                "player_strikeouts": "mlb_stats_api",
-                "player_earned_runs": "mlb_stats_api",
-                "player_outs": "mlb_stats_api",
-                "1st_quarter_player_points": "nba_period_props",
-                "2nd_quarter_player_points": "nba_period_props",
-                "3rd_quarter_player_points": "nba_period_props",
-                "4th_quarter_player_points": "nba_period_props",
-                "1st_half_player_points": "nba_period_props",
-                "2nd_half_player_points": "nba_period_props",
-                "1st_quarter_total_points": "nba_period_props",
-                "2nd_quarter_total_points": "nba_period_props",
-                "3rd_quarter_total_points": "nba_period_props",
-                "4th_quarter_total_points": "nba_period_props",
-                "1st_quarter_total_points_odd_even": "nba_period_props",
-                "2nd_quarter_total_points_odd_even": "nba_period_props",
-                "3rd_quarter_total_points_odd_even": "nba_period_props",
-                "1st_quarter_moneyline": "nba_period_props",
-                "2nd_quarter_moneyline": "nba_period_props",
-                "3rd_quarter_moneyline": "nba_period_props",
-                "4th_quarter_moneyline": "nba_period_props",
-                "1st_quarter_point_spread": "nba_period_props",
-                "2nd_quarter_point_spread": "nba_period_props",
-                "3rd_quarter_point_spread": "nba_period_props",
-                "4th_quarter_point_spread": "nba_period_props",
-                "1st_quarter_team_total": "nba_period_props",
-                "2nd_quarter_team_total": "nba_period_props",
-                "3rd_quarter_team_total": "nba_period_props",
-                "4th_quarter_team_total": "nba_period_props",
-                "1st_half_total_points": "nba_period_props",
-                "1st_half_total_points_odd_even": "nba_period_props",
-                "2nd_half_total_points_odd_even": "nba_period_props",
-                "1st_half_moneyline": "nba_period_props",
-                "1st_half_point_spread": "nba_period_props",
-                "1st_half_team_total": "nba_period_props",
-                "total_points_odd_even": "nba_period_props",
-                "will_there_be_overtime": "nba_period_props",
-                "team_first_basket": "nba_period_props",
-                "first_basket": "nba_period_props",
-                "first_basket_including_ft": "nba_period_props",
-                # MMA — ESPN scoreboard (with direct API fallback for past events)
-                "go_the_distance": "espn_mma",
-                "total_rounds": "espn_mma",
-            },
-            "espn_limitation": [
-                "player_pass_yards",
-                "player_rush_yards",
-                "player_receiving_yards",
-                "player_pass_tds",
-                "player_receptions",
-                "player_tackles",
-                "player_sacks",
-                "player_interceptions",
-                "player_carry_yards",
-                "player_shots_on_target",
-                "player_offsides",
-                "player_cards",
-                "player_aces",
-                "player_double_faults",
-                "player_sets_won",
-                "anytime_scorer",
-                "first_scorer",
-                "last_scorer",
-                "first_td",
-                "last_td",
-                "first_basket",
-                "player_double_double",
-                "player_triple_double",
-                "player_hat_trick",
-            ],
-            "period_auto_settleable": sorted(_PERIOD_SETTLEABLE),
-            "game_specialty": [
-                "will_there_be_a_tiebreak",
-                "set_handicap",
-                "first_team_to_score",
-                "1st_half_total_corners",
-                "team_total",
-            ],
-            "notes": (
-                "Markets in 'espn_limitation' are tracked but will not auto-settle. "
-                "Markets in 'period_auto_settleable' settle automatically from ESPN "
-                "period/linescore data (NBA quarters/halves, MLB innings, NHL periods, "
-                "soccer halftime). MLB batting props like runs, home runs, doubles, "
-                "triples, bases, and singles settle from Baseball Savant /gf via the "
-                "mlb_period_props module. "
-                "NBA period player-points markets (1Q/2Q/3Q/4Q/1H/2H) settle via "
-                "nba_period_props (DataBallr play-by-play and box score). "
-                "MMA markets (go_the_distance, total_rounds, moneyline) settle via "
-                "ESPN UFC scoreboard with direct API fallback for past bouts. "
-                "Pick values for go_the_distance: yes/over (went distance) or no/under (early finish). "
-                "Markets in 'game_specialty' must be settled manually via "
-                "POST /bets/{bet_id}/settle. "
-                "player_strikeouts and player_earned_runs settle via the official "
-                "MLB Stats API (statsapi.mlb.com) — see auto_settleable_sources."
-            ),
-        }
-    )
+async def bets_prop_markets(user: Optional[dict] = Depends(require_auth)) -> JSONResponse:
+    return JSONResponse({
+        "auto_settleable": [
+            "player_points", "player_rebounds", "player_assists", "player_threes",
+            "player_made_threes", "player_rebounds_assists", "player_points_assists",
+            "player_points_rebounds", "player_points_rebounds_assists",
+            "player_steals", "player_blocks", "player_turnovers", "player_minutes",
+            "player_fg_made", "player_ft_made", "player_goals", "player_saves",
+            "player_yellow_cards", "player_goals_hockey", "player_assists_hockey",
+            "player_hits", "player_rbis", "player_runs", "player_home_runs",
+            "player_doubles", "player_triples", "player_bases", "player_singles",
+            "player_hits_runs_rbis", "player_runs_cricket", "player_wickets_cricket",
+            "player_strikeouts", "player_earned_runs", "player_outs",
+            "1st_quarter_total_points", "2nd_quarter_total_points",
+            "3rd_quarter_total_points", "4th_quarter_total_points",
+            "1st_quarter_total_points_odd_even", "2nd_quarter_total_points_odd_even",
+            "3rd_quarter_total_points_odd_even",
+            "1st_quarter_moneyline", "2nd_quarter_moneyline",
+            "3rd_quarter_moneyline", "4th_quarter_moneyline",
+            "1st_quarter_point_spread", "2nd_quarter_point_spread",
+            "3rd_quarter_point_spread", "4th_quarter_point_spread",
+            "1st_quarter_team_total", "2nd_quarter_team_total",
+            "3rd_quarter_team_total", "4th_quarter_team_total",
+            "1st_half_total_points", "1st_half_total_points_odd_even",
+            "2nd_half_total_points_odd_even", "1st_half_moneyline",
+            "1st_half_point_spread", "1st_half_team_total",
+            "1st_quarter_player_points", "2nd_quarter_player_points",
+            "3rd_quarter_player_points", "4th_quarter_player_points",
+            "1st_half_player_points", "2nd_half_player_points",
+            "total_points_odd_even", "will_there_be_overtime",
+            "team_first_basket", "first_basket", "first_basket_including_ft",
+            # MMA
+            "go_the_distance", "total_rounds",
+        ],
+        "auto_settleable_sources": {
+            "player_runs": "mlb_period_props",
+            "player_home_runs": "mlb_period_props",
+            "player_doubles": "mlb_period_props",
+            "player_triples": "mlb_period_props",
+            "player_bases": "mlb_period_props",
+            "player_singles": "mlb_period_props",
+            "player_hits_runs_rbis": "mlb_period_props",
+            "player_strikeouts": "mlb_stats_api",
+            "player_earned_runs": "mlb_stats_api",
+            "player_outs": "mlb_stats_api",
+            "1st_quarter_player_points": "nba_period_props",
+            "2nd_quarter_player_points": "nba_period_props",
+            "3rd_quarter_player_points": "nba_period_props",
+            "4th_quarter_player_points": "nba_period_props",
+            "1st_half_player_points": "nba_period_props",
+            "2nd_half_player_points": "nba_period_props",
+            "1st_quarter_total_points": "nba_period_props",
+            "2nd_quarter_total_points": "nba_period_props",
+            "3rd_quarter_total_points": "nba_period_props",
+            "4th_quarter_total_points": "nba_period_props",
+            "1st_quarter_total_points_odd_even": "nba_period_props",
+            "2nd_quarter_total_points_odd_even": "nba_period_props",
+            "3rd_quarter_total_points_odd_even": "nba_period_props",
+            "1st_quarter_moneyline": "nba_period_props",
+            "2nd_quarter_moneyline": "nba_period_props",
+            "3rd_quarter_moneyline": "nba_period_props",
+            "4th_quarter_moneyline": "nba_period_props",
+            "1st_quarter_point_spread": "nba_period_props",
+            "2nd_quarter_point_spread": "nba_period_props",
+            "3rd_quarter_point_spread": "nba_period_props",
+            "4th_quarter_point_spread": "nba_period_props",
+            "1st_quarter_team_total": "nba_period_props",
+            "2nd_quarter_team_total": "nba_period_props",
+            "3rd_quarter_team_total": "nba_period_props",
+            "4th_quarter_team_total": "nba_period_props",
+            "1st_half_total_points": "nba_period_props",
+            "1st_half_total_points_odd_even": "nba_period_props",
+            "2nd_half_total_points_odd_even": "nba_period_props",
+            "1st_half_moneyline": "nba_period_props",
+            "1st_half_point_spread": "nba_period_props",
+            "1st_half_team_total": "nba_period_props",
+            "total_points_odd_even": "nba_period_props",
+            "will_there_be_overtime": "nba_period_props",
+            "team_first_basket": "nba_period_props",
+            "first_basket": "nba_period_props",
+            "first_basket_including_ft": "nba_period_props",
+            # MMA — ESPN scoreboard (with direct API fallback for past events)
+            "go_the_distance": "espn_mma",
+            "total_rounds": "espn_mma",
+        },
+        "espn_limitation": [
+            "player_pass_yards", "player_rush_yards", "player_receiving_yards",
+            "player_pass_tds", "player_receptions", "player_tackles", "player_sacks",
+            "player_interceptions", "player_carry_yards", "player_shots_on_target",
+            "player_offsides", "player_cards", "player_aces", "player_double_faults",
+            "player_sets_won", "anytime_scorer", "first_scorer", "last_scorer",
+            "first_td", "last_td", "first_basket", "player_double_double",
+            "player_triple_double", "player_hat_trick",
+        ],
+        "period_auto_settleable": sorted(_PERIOD_SETTLEABLE),
+        "game_specialty": [
+            "will_there_be_a_tiebreak", "set_handicap", "first_team_to_score",
+            "1st_half_total_corners", "team_total",
+        ],
+        "notes": (
+            "Markets in 'espn_limitation' are tracked but will not auto-settle. "
+            "Markets in 'period_auto_settleable' settle automatically from ESPN "
+            "period/linescore data (NBA quarters/halves, MLB innings, NHL periods, "
+            "soccer halftime). MLB batting props like runs, home runs, doubles, "
+            "triples, bases, and singles settle from Baseball Savant /gf via the "
+            "mlb_period_props module. "
+            "NBA period player-points markets (1Q/2Q/3Q/4Q/1H/2H) settle via "
+            "nba_period_props (DataBallr play-by-play and box score). "
+            "MMA markets (go_the_distance, total_rounds, moneyline) settle via "
+            "ESPN UFC scoreboard with direct API fallback for past bouts. "
+            "Pick values for go_the_distance: yes/over (went distance) or no/under (early finish). "
+            "Markets in 'game_specialty' must be settled manually via "
+            "POST /bets/{bet_id}/settle. "
+            "player_strikeouts and player_earned_runs settle via the official "
+            "MLB Stats API (statsapi.mlb.com) — see auto_settleable_sources."
+        ),
+    })
 
 
 @app.get("/bets/{bet_id}", tags=["bets"])
@@ -2157,8 +2235,12 @@ async def get_bet(
     if bet["status"] == "pending":
         settlement = await _build_settlement(bet)
         bet = await run_in_threadpool(bet_tracking.get_bet, bet_id) or bet
+        if settlement.get("settled") and settlement.get("outcome") in {"win", "loss", "push"}:
+            asyncio.ensure_future(_calculate_clv_for_bet(bet_id))
     else:
         settlement = _stored_settlement(bet)
+        if bet.get("book_clv") is None and bet.get("event_id") and bet["status"] in {"win", "loss", "push"}:
+            asyncio.ensure_future(_calculate_clv_for_bet(bet_id))
     return JSONResponse(_bet_response(bet, settlement))
 
 
@@ -2178,6 +2260,8 @@ async def settle_bet(
             }
         )
     settlement = await _build_settlement(bet)
+    if settlement.get("settled") and settlement.get("outcome") in {"win", "loss", "push"}:
+        asyncio.ensure_future(_calculate_clv_for_bet(bet_id))
     fresh_bet = await run_in_threadpool(bet_tracking.get_bet, bet_id)
     if fresh_bet is not None:
         bet = fresh_bet
@@ -2272,6 +2356,9 @@ async def settle_pending_bets_for_user(
 
         outcome = str(settlement.get("outcome") or "pending")
         settled = bool(settlement.get("settled"))
+
+        if outcome in {"win", "loss", "push"}:
+            asyncio.ensure_future(_calculate_clv_for_bet(bet["bet_id"]))
 
         if outcome in {"win", "loss", "push", "void"}:
             summary[outcome] += 1
