@@ -35,10 +35,10 @@ import sports_bridge
 from auth import require_auth, router as auth_router
 from admin import router as admin_router
 
-
 # ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -115,6 +115,7 @@ def _compute_book_clv(bet_odds: int, closing_pick_odds: int) -> float | None:
 # Request model (mirrors cache-api CreateBetRequest exactly)
 # ---------------------------------------------------------------------------
 
+
 class CreateBetRequest(BaseModel):
     market:     str
     pick:       Optional[str]         = Field(None)
@@ -141,7 +142,7 @@ class CreateBetRequest(BaseModel):
     @field_validator("market")
     @classmethod
     def validate_market(cls, v: str) -> str:
-        norm = re.sub(r'[^a-z0-9]+', '_', v.strip().lower()).strip('_')
+        norm = re.sub(r"[^a-z0-9]+", "_", v.strip().lower()).strip("_")
         game_aliases = {
             "moneyline": "moneyline", "ml": "moneyline",
             "spread": "spread", "game_spread": "spread",
@@ -208,21 +209,27 @@ class CreateBetRequest(BaseModel):
         # of whether pick was already supplied in the payload.
         if self.market.startswith("player_") and isinstance(self.line, str):
             raw_line = self.line.strip()
-            direction = re.search(r'\b(over|under)\b', raw_line, re.IGNORECASE)
+            direction = re.search(r"\b(over|under)\b", raw_line, re.IGNORECASE)
             if direction and not self.pick:
                 self.pick = direction.group(1).lower()
-            number = re.search(r'(\d+(?:\.\d+)?)\s*$', raw_line)
+            number = re.search(r"(\d+(?:\.\d+)?)\s*$", raw_line)
             if number:
                 self.line = float(number.group(1))
 
         # For total markets: parse "Over 221.5" / "Under 47.5" into pick + numeric line.
-        _TOTAL_MARKETS = {"total", "total_goals", "total_runs", "total_corners", "game_total"}
+        _TOTAL_MARKETS = {
+            "total",
+            "total_goals",
+            "total_runs",
+            "total_corners",
+            "game_total",
+        }
         if self.market in _TOTAL_MARKETS and isinstance(self.line, str):
             raw_line = self.line.strip()
-            direction = re.search(r'\b(over|under)\b', raw_line, re.IGNORECASE)
+            direction = re.search(r"\b(over|under)\b", raw_line, re.IGNORECASE)
             if direction and not self.pick:
                 self.pick = direction.group(1).lower()
-            number = re.search(r'(\d+(?:\.\d+)?)\s*$', raw_line)
+            number = re.search(r"(\d+(?:\.\d+)?)\s*$", raw_line)
             if number:
                 self.line = float(number.group(1))
 
@@ -254,14 +261,20 @@ class CreateBetRequest(BaseModel):
 
         if _is_prop:
             if self.pick is None:
-                raise ValueError("pick is required for player prop bets. Use 'over' or 'under'.")
+                raise ValueError(
+                    "pick is required for player prop bets. Use 'over' or 'under'."
+                )
             if self.pick.lower() not in {"over", "under"}:
-                raise ValueError(f"pick must be 'over' or 'under' for player prop market '{self.market}'.")
+                raise ValueError(
+                    f"pick must be 'over' or 'under' for player prop market '{self.market}'."
+                )
             self.pick = self.pick.lower()
             if not self.player:
                 raise ValueError("player name is required for player prop bets.")
         elif self.pick is None and not _is_specialty:
-            raise ValueError("pick is required, or provide a selection line that implies the pick")
+            raise ValueError(
+                "pick is required, or provide a selection line that implies the pick"
+            )
 
         return self
 
@@ -272,10 +285,13 @@ class CreateBetRequest(BaseModel):
 
 _LEAGUE_TO_ESPN_PATH: dict[str, tuple[str, str]] = {
     # Tennis
-    "atp": ("tennis", "atp"), "wta": ("tennis", "wta"),
-    "itf": ("tennis", "itf-men"), "challenger": ("tennis", "atp-challenger"),
+    "atp": ("tennis", "atp"),
+    "wta": ("tennis", "wta"),
+    "itf": ("tennis", "itf-men"),
+    "challenger": ("tennis", "atp-challenger"),
     # Basketball
-    "nba": ("basketball", "nba"), "wnba": ("basketball", "wnba"),
+    "nba": ("basketball", "nba"),
+    "wnba": ("basketball", "wnba"),
     "ncaab": ("basketball", "mens-college-basketball"),
     "nba g league": ("basketball", "nba-g-league"),
     # Baseball
@@ -283,34 +299,63 @@ _LEAGUE_TO_ESPN_PATH: dict[str, tuple[str, str]] = {
     # Hockey
     "nhl": ("hockey", "nhl"),
     # Soccer — scoreboard only (halftime via summary endpoint)
-    "epl": ("soccer", "eng.1"),   "eng.1": ("soccer", "eng.1"),
-    "laliga": ("soccer", "esp.1"), "esp.1": ("soccer", "esp.1"),
-    "bundesliga": ("soccer", "ger.1"), "ger.1": ("soccer", "ger.1"),
-    "seriea": ("soccer", "ita.1"), "ita.1": ("soccer", "ita.1"),
-    "ligue1": ("soccer", "fra.1"), "fra.1": ("soccer", "fra.1"),
+    "epl": ("soccer", "eng.1"),
+    "eng.1": ("soccer", "eng.1"),
+    "laliga": ("soccer", "esp.1"),
+    "esp.1": ("soccer", "esp.1"),
+    "bundesliga": ("soccer", "ger.1"),
+    "ger.1": ("soccer", "ger.1"),
+    "seriea": ("soccer", "ita.1"),
+    "ita.1": ("soccer", "ita.1"),
+    "ligue1": ("soccer", "fra.1"),
+    "fra.1": ("soccer", "fra.1"),
     "mls": ("soccer", "usa.1"),
     "ucl": ("soccer", "uefa.champions"),
     "uel": ("soccer", "uefa.europa"),
     # MMA
-    "ufc": ("mma", "ufc"), "mma": ("mma", "ufc"), "bellator": ("mma", "bellator"),
+    "ufc": ("mma", "ufc"),
+    "mma": ("mma", "ufc"),
+    "bellator": ("mma", "bellator"),
 }
 
 _AUTO_SETTLEABLE = {
     # ── Core markets (all sports) ──────────────────────────────────────────
-    "moneyline", "spread", "total",
-    "puck_line", "run_line",
+    "moneyline",
+    "spread",
+    "total",
+    "puck_line",
+    "run_line",
     # ── Baseball ──────────────────────────────────────────────────────────
-    "total_goals", "total_runs", "total_corners",
-    "team_total", "1st_half_total_runs", "1st_half_team_total",
-    "1st_inning_moneyline", "1st_3_innings_moneyline", "1st_7_innings_moneyline",
-    "1st_half_moneyline", "1st_5_innings_moneyline",
-    "1st_inning_run_line", "1st_3_innings_run_line", "1st_7_innings_run_line", "1st_half_run_line",
-    "1st_5_innings_total", "1st_5_innings_team_total",
-    "1st_inning_total_runs", "1st_3_innings_total_runs",
-    "2nd_inning_total_runs", "3rd_inning_total_runs", "4th_inning_total_runs",
-    "5th_inning_total_runs", "6th_inning_total_runs", "7th_inning_total_runs",
-    "8th_inning_total_runs", "9th_inning_total_runs",
-    "1st_inning_total_runs_odd_even", "1st_7_innings_total_runs", "total_runs_odd_even",
+    "total_goals",
+    "total_runs",
+    "total_corners",
+    "team_total",
+    "1st_half_total_runs",
+    "1st_half_team_total",
+    "1st_inning_moneyline",
+    "1st_3_innings_moneyline",
+    "1st_7_innings_moneyline",
+    "1st_half_moneyline",
+    "1st_5_innings_moneyline",
+    "1st_inning_run_line",
+    "1st_3_innings_run_line",
+    "1st_7_innings_run_line",
+    "1st_half_run_line",
+    "1st_5_innings_total",
+    "1st_5_innings_team_total",
+    "1st_inning_total_runs",
+    "1st_3_innings_total_runs",
+    "2nd_inning_total_runs",
+    "3rd_inning_total_runs",
+    "4th_inning_total_runs",
+    "5th_inning_total_runs",
+    "6th_inning_total_runs",
+    "7th_inning_total_runs",
+    "8th_inning_total_runs",
+    "9th_inning_total_runs",
+    "1st_inning_total_runs_odd_even",
+    "1st_7_innings_total_runs",
+    "total_runs_odd_even",
     # ── Soccer — full-game ─────────────────────────────────────────────────
     "both_teams_to_score",
     "draw_bet",
@@ -342,56 +387,119 @@ _AUTO_SETTLEABLE = {
     "2nd_half_total_corners",
     "2nd_half_team_total_corners",
     # NBA period/specialty markets routed via stats_api -> nba_period_props
-    "1st_quarter_total_points", "2nd_quarter_total_points",
-    "3rd_quarter_total_points", "4th_quarter_total_points",
-    "1st_quarter_total_points_odd_even", "2nd_quarter_total_points_odd_even",
+    "1st_quarter_total_points",
+    "2nd_quarter_total_points",
+    "3rd_quarter_total_points",
+    "4th_quarter_total_points",
+    "1st_quarter_total_points_odd_even",
+    "2nd_quarter_total_points_odd_even",
     "3rd_quarter_total_points_odd_even",
-    "1st_quarter_moneyline", "2nd_quarter_moneyline",
-    "3rd_quarter_moneyline", "4th_quarter_moneyline",
-    "1st_quarter_point_spread", "2nd_quarter_point_spread",
-    "3rd_quarter_point_spread", "4th_quarter_point_spread",
-    "1st_quarter_team_total", "2nd_quarter_team_total",
-    "3rd_quarter_team_total", "4th_quarter_team_total",
-    "1st_half_total_points", "1st_half_total_points_odd_even",
-    "2nd_half_total_points_odd_even", "1st_half_point_spread",
-    "1st_quarter_player_points", "2nd_quarter_player_points",
-    "3rd_quarter_player_points", "4th_quarter_player_points",
-    "1st_half_player_points", "2nd_half_player_points",
-    "total_points_odd_even", "will_there_be_overtime",
-    "team_first_basket", "first_basket", "first_basket_including_ft",
+    "1st_quarter_moneyline",
+    "2nd_quarter_moneyline",
+    "3rd_quarter_moneyline",
+    "4th_quarter_moneyline",
+    "1st_quarter_point_spread",
+    "2nd_quarter_point_spread",
+    "3rd_quarter_point_spread",
+    "4th_quarter_point_spread",
+    "1st_quarter_team_total",
+    "2nd_quarter_team_total",
+    "3rd_quarter_team_total",
+    "4th_quarter_team_total",
+    "1st_half_total_points",
+    "1st_half_total_points_odd_even",
+    "2nd_half_total_points_odd_even",
+    "1st_half_point_spread",
+    "1st_quarter_player_points",
+    "2nd_quarter_player_points",
+    "3rd_quarter_player_points",
+    "4th_quarter_player_points",
+    "1st_half_player_points",
+    "2nd_half_player_points",
+    "total_points_odd_even",
+    "will_there_be_overtime",
+    "team_first_basket",
+    "first_basket",
+    "first_basket_including_ft",
     # MMA markets
-    "go_the_distance", "total_rounds",
+    "go_the_distance",
+    "total_rounds",
+    # ── Tennis — set-level and match-level markets (settled via SofaScore) ──
+    "game_spread",
+    "total_games",
+    "total_sets",
+    "set_handicap",
+    "1st_set_moneyline",
+    "1st_set_game_spread",
+    "1st_set_total_games",
+    "1st_set_will_there_be_a_tiebreak",
+    "2nd_set_moneyline",
+    "2nd_set_total_games",
 }
 
 # MLB period markets that should settle via stats_api market-check (Savant /gf)
 _MLB_MARKETCHECK_ROUTED = {
-    "1st_half_total_runs", "team_total",
-    "1st_half_moneyline", "run_line", "moneyline", "total_runs",
-    "1st_inning_moneyline", "1st_3_innings_moneyline", "1st_7_innings_moneyline",
-    "1st_inning_run_line", "1st_3_innings_run_line", "1st_7_innings_run_line", "1st_half_run_line",
-    "1st_5_innings_moneyline", "1st_5_innings_total", "1st_5_innings_team_total",
-    "1st_inning_total_runs", "2nd_inning_total_runs", "3rd_inning_total_runs", "4th_inning_total_runs",
-    "5th_inning_total_runs", "6th_inning_total_runs", "7th_inning_total_runs", "8th_inning_total_runs",
-    "9th_inning_total_runs", "1st_3_innings_total_runs", "1st_7_innings_total_runs",
-    "1st_inning_total_runs_odd_even", "total_runs_odd_even", "1st_half_team_total",
+    "1st_half_total_runs",
+    "team_total",
+    "1st_half_moneyline",
+    "run_line",
+    "moneyline",
+    "total_runs",
+    "1st_inning_moneyline",
+    "1st_3_innings_moneyline",
+    "1st_7_innings_moneyline",
+    "1st_inning_run_line",
+    "1st_3_innings_run_line",
+    "1st_7_innings_run_line",
+    "1st_half_run_line",
+    "1st_5_innings_moneyline",
+    "1st_5_innings_total",
+    "1st_5_innings_team_total",
+    "1st_inning_total_runs",
+    "2nd_inning_total_runs",
+    "3rd_inning_total_runs",
+    "4th_inning_total_runs",
+    "5th_inning_total_runs",
+    "6th_inning_total_runs",
+    "7th_inning_total_runs",
+    "8th_inning_total_runs",
+    "9th_inning_total_runs",
+    "1st_3_innings_total_runs",
+    "1st_7_innings_total_runs",
+    "1st_inning_total_runs_odd_even",
+    "total_runs_odd_even",
+    "1st_half_team_total",
 }
 
 # Period markets that can be auto-settled from ESPN linescore data
 _PERIOD_SETTLEABLE = {
     # Basketball — quarter & half
-    "1st_quarter_moneyline", "1st_quarter_point_spread", "1st_quarter_total_points",
+    "1st_quarter_moneyline",
+    "1st_quarter_point_spread",
+    "1st_quarter_total_points",
     "1st_quarter_team_total",
-    "1st_half_moneyline", "1st_half_point_spread", "1st_half_total_points",
+    "1st_half_moneyline",
+    "1st_half_point_spread",
+    "1st_half_total_points",
     "1st_half_team_total",
-    "1st_half_home_team_total", "1st_half_away_team_total",
-    "2nd_half_moneyline", "2nd_half_total_points", "2nd_half_team_total",
+    "1st_half_home_team_total",
+    "1st_half_away_team_total",
+    "2nd_half_moneyline",
+    "2nd_half_total_points",
+    "2nd_half_team_total",
     "2nd_half_both_teams_to_score",
     # Baseball — innings
-    "1st_inning_total_runs", "1st_3_innings_run_line", "1st_3_innings_total_runs",
-    "1st_5_innings_moneyline", "1st_5_innings_total", "1st_5_innings_team_total",
+    "1st_inning_total_runs",
+    "1st_3_innings_run_line",
+    "1st_3_innings_total_runs",
+    "1st_5_innings_moneyline",
+    "1st_5_innings_total",
+    "1st_5_innings_team_total",
     # Hockey — period
-    "1st_period_moneyline", "1st_period_total_goals",
-    "2nd_period_moneyline", "2nd_period_total_goals",
+    "1st_period_moneyline",
+    "1st_period_total_goals",
+    "2nd_period_moneyline",
+    "2nd_period_total_goals",
     # Soccer halftime markets were moved to _AUTO_SETTLEABLE → SofaScore via stats_api.
     # ESPN period settlement for soccer is no longer used as primary source.
 }
@@ -415,7 +523,11 @@ _SPREAD_PICK_RE = re.compile(r"^(?P<team>.+?)\s+(?P<spread>[+-]?\d+(?:\.\d+)?)$"
 
 def _is_spread_market(market: str) -> bool:
     m = (market or "").lower()
-    return m in _SPREAD_CORE_MARKETS or m.endswith("_point_spread") or m.endswith("_run_line")
+    return (
+        m in _SPREAD_CORE_MARKETS
+        or m.endswith("_point_spread")
+        or m.endswith("_run_line")
+    )
 
 
 def _parse_spread_selection(raw: str) -> tuple[str, float] | None:
@@ -502,7 +614,7 @@ def _is_future_game(bet: dict) -> bool:
 
 
 async def _resolve_game_for_bet(bet: dict) -> tuple[str | None, str | None, str | None]:
-    event_id  = bet.get("event_id")
+    event_id = bet.get("event_id")
     home_team = bet.get("home_team")
     away_team = bet.get("away_team")
     return event_id, home_team, away_team
@@ -517,8 +629,8 @@ async def _espn_fetch_competition(bet: dict) -> tuple[dict | None, str | None]:
     import httpx as _httpx
 
     league = (bet.get("league") or "").lower().strip()
-    sport  = (bet.get("sport")  or "").lower().strip()
-    date   = bet.get("date")
+    sport = (bet.get("sport") or "").lower().strip()
+    date = bet.get("date")
 
     espn_path = _LEAGUE_TO_ESPN_PATH.get(league)
     if not espn_path:
@@ -542,8 +654,11 @@ async def _espn_fetch_competition(bet: dict) -> tuple[dict | None, str | None]:
 
     try:
         async with _httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(url, params={"dates": date.replace("-", ""), "limit": 100},
-                                 headers={"User-Agent": "Mozilla/5.0"})
+            r = await client.get(
+                url,
+                params={"dates": date.replace("-", ""), "limit": 100},
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
             if r.status_code != 200:
                 return None, None
             data = r.json()
@@ -574,7 +689,12 @@ async def _espn_fetch_competition(bet: dict) -> tuple[dict | None, str | None]:
         for c in comp.get("competitors", []):
             for key in ("athlete", "team"):
                 obj = c.get(key) or {}
-                for field in ("displayName", "shortDisplayName", "abbreviation", "lastName"):
+                for field in (
+                    "displayName",
+                    "shortDisplayName",
+                    "abbreviation",
+                    "lastName",
+                ):
                     v = obj.get(field)
                     if v:
                         out.append(v.lower())
@@ -600,10 +720,10 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
     """Settle period/half/inning markets using ESPN linescore data (free, no key needed)."""
     import httpx as _httpx
 
-    market   = (bet.get("market") or "").lower()
+    market = (bet.get("market") or "").lower()
     team_pick, line_val = _spread_pick_and_line_for_settlement(bet)
     pick_raw = team_pick.lower()
-    sport    = (bet.get("sport")  or "").lower()
+    sport = (bet.get("sport") or "").lower()
 
     comp, league_path = await _espn_fetch_competition(bet)
     if not comp:
@@ -612,34 +732,58 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
     st = comp.get("status", {})
     if st.get("type", {}).get("state") != "post":
         return {
-            "outcome": "pending", "settled": False, "source": "espn_public",
-            "score": None, "pricing": None,
+            "outcome": "pending",
+            "settled": False,
+            "source": "espn_public",
+            "score": None,
+            "pricing": None,
             "note": f"Game not yet final — {st.get('type', {}).get('description', 'in progress')}",
         }
 
     competitors = comp.get("competitors", [])
-    home_comp = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0] if competitors else {})
-    away_comp = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1] if len(competitors) > 1 else {})
+    home_comp = next(
+        (c for c in competitors if c.get("homeAway") == "home"),
+        competitors[0] if competitors else {},
+    )
+    away_comp = next(
+        (c for c in competitors if c.get("homeAway") == "away"),
+        competitors[1] if len(competitors) > 1 else {},
+    )
 
     # ── Soccer: fetch halftime from summary endpoint ──────────────────────────
-    is_soccer = "soccer" in sport or "football" in sport or "soccer" in (comp.get("_sport_path") or "")
+    is_soccer = (
+        "soccer" in sport
+        or "football" in sport
+        or "soccer" in (comp.get("_sport_path") or "")
+    )
     if is_soccer:
         event_id = comp.get("_event_id", "")
-        lp       = comp.get("_league_path", league_path or "eng.1")
-        summary_url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{lp}/summary"
+        lp = comp.get("_league_path", league_path or "eng.1")
+        summary_url = (
+            f"https://site.api.espn.com/apis/site/v2/sports/soccer/{lp}/summary"
+        )
         try:
             async with _httpx.AsyncClient(timeout=10.0) as client:
-                sr = await client.get(summary_url, params={"event": event_id},
-                                      headers={"User-Agent": "Mozilla/5.0"})
+                sr = await client.get(
+                    summary_url,
+                    params={"event": event_id},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
                 if sr.status_code == 200:
                     sdata = sr.json()
-                    for sc in (sdata.get("header", {}).get("competitions") or []):
+                    for sc in sdata.get("header", {}).get("competitions") or []:
                         for c in sc.get("competitors", []):
                             ha = c.get("homeAway", "")
                             if ha == "home":
-                                home_comp = {**home_comp, "linescores": c.get("linescores", [])}
+                                home_comp = {
+                                    **home_comp,
+                                    "linescores": c.get("linescores", []),
+                                }
                             elif ha == "away":
-                                away_comp = {**away_comp, "linescores": c.get("linescores", [])}
+                                away_comp = {
+                                    **away_comp,
+                                    "linescores": c.get("linescores", []),
+                                }
         except Exception:
             pass
 
@@ -709,7 +853,7 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
             return "win" if ps > line else ("push" if ps == line else "loss")
         return "win" if ps < line else ("push" if ps == line else "loss")
 
-    outcome    = "pending"
+    outcome = "pending"
     period_det: dict = {}
 
     # ── Basketball ────────────────────────────────────────────────────────────
@@ -748,7 +892,15 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
         period_det = {"pick_1h": ps, "opp_1h": os}
         outcome = _spread(ps, os, float(line_val))
 
-    elif market in ("1st_half_team_total", "1st_half_home_team_total", "1st_half_away_team_total") and line_val is not None:
+    elif (
+        market
+        in (
+            "1st_half_team_total",
+            "1st_half_home_team_total",
+            "1st_half_away_team_total",
+        )
+        and line_val is not None
+    ):
         ps = _sum(pick_scores, [1, 2])
         period_det = {"pick_1h": ps}
         outcome = _team_total(ps, float(line_val), pick_raw)
@@ -769,7 +921,8 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
         outcome = _team_total(ps, float(line_val), pick_raw)
 
     elif market == "2nd_half_both_teams_to_score":
-        hs2 = _sum(home_scores, [3, 4]); as2 = _sum(away_scores, [3, 4])
+        hs2 = _sum(home_scores, [3, 4])
+        as2 = _sum(away_scores, [3, 4])
         period_det = {"home_2h": hs2, "away_2h": as2}
         outcome = "win" if hs2 > 0 and as2 > 0 else "loss"
 
@@ -826,17 +979,25 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
         outcome = _total(total, float(line_val), pick_raw)
 
     # ── Soccer halftime ───────────────────────────────────────────────────────
-    elif market in ("1st_half_both_teams_to_score", "1st_half_draw_bet",
-                    "1st_half_total_goals", "1st_half_asian_total_goals"):
+    elif market in (
+        "1st_half_both_teams_to_score",
+        "1st_half_draw_bet",
+        "1st_half_total_goals",
+        "1st_half_asian_total_goals",
+    ):
         # linescores index 0 = first half for soccer
-        h1 = home_scores.get(1, 0.0); a1 = away_scores.get(1, 0.0)
+        h1 = home_scores.get(1, 0.0)
+        a1 = away_scores.get(1, 0.0)
         period_det = {"home_ht": h1, "away_ht": a1, "ht_total": h1 + a1}
 
         if market == "1st_half_both_teams_to_score":
             outcome = "win" if h1 > 0 and a1 > 0 else "loss"
         elif market == "1st_half_draw_bet":
             outcome = "win" if h1 == a1 else "loss"
-        elif market in ("1st_half_total_goals", "1st_half_asian_total_goals") and line_val is not None:
+        elif (
+            market in ("1st_half_total_goals", "1st_half_asian_total_goals")
+            and line_val is not None
+        ):
             total = h1 + a1
             outcome = _total(total, float(line_val), pick_raw)
 
@@ -866,8 +1027,8 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
     import httpx as _httpx
 
     league = (bet.get("league") or "").lower().strip()
-    sport  = (bet.get("sport")  or "").lower().strip()
-    date   = bet.get("date")
+    sport = (bet.get("sport") or "").lower().strip()
+    date = bet.get("date")
 
     espn_path = _LEAGUE_TO_ESPN_PATH.get(league)
     if not espn_path and "tennis" in sport:
@@ -880,8 +1041,11 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
 
     try:
         async with _httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(url, params={"dates": date.replace("-", ""), "limit": 100},
-                                 headers={"User-Agent": "Mozilla/5.0"})
+            r = await client.get(
+                url,
+                params={"dates": date.replace("-", ""), "limit": 100},
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
             if r.status_code != 200:
                 return None
             data = r.json()
@@ -907,7 +1071,12 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
         for c in comp.get("competitors", []):
             for key in ("athlete", "team"):
                 obj = c.get(key) or {}
-                for field in ("displayName", "shortDisplayName", "abbreviation", "lastName"):
+                for field in (
+                    "displayName",
+                    "shortDisplayName",
+                    "abbreviation",
+                    "lastName",
+                ):
                     v = obj.get(field)
                     if v:
                         out.append(v.lower())
@@ -921,23 +1090,32 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
     for comp in all_competitions:
         all_names = _comp_names(comp)
         if home_want and away_want:
-            if _name_matches(home_want, all_names) and _name_matches(away_want, all_names):
-                target_comp = comp; break
+            if _name_matches(home_want, all_names) and _name_matches(
+                away_want, all_names
+            ):
+                target_comp = comp
+                break
         elif team_want:
             if _name_matches(team_want, all_names):
-                target_comp = comp; break
+                target_comp = comp
+                break
 
     if not target_comp:
         return None
 
-    st      = target_comp.get("status", {})
-    stt     = st.get("type", {})
+    st = target_comp.get("status", {})
+    stt = st.get("type", {})
     is_final = stt.get("state") == "post"
 
     if not is_final:
-        return {"outcome": "pending", "settled": False, "source": "espn_public",
-                "score": None, "pricing": None,
-                "note": f"Match not yet final — status: {stt.get('description', 'in progress')}"}
+        return {
+            "outcome": "pending",
+            "settled": False,
+            "source": "espn_public",
+            "score": None,
+            "pricing": None,
+            "note": f"Match not yet final — status: {stt.get('description', 'in progress')}",
+        }
 
     competitors = target_comp.get("competitors", [])
     c0 = competitors[0] if competitors else {}
@@ -948,7 +1126,8 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
             obj = c.get(key) or {}
             for field in ("displayName", "shortDisplayName", "lastName"):
                 v = obj.get(field)
-                if v: return v
+                if v:
+                    return v
         return "unknown"
 
     def _sets_won(c: dict) -> int:
@@ -956,9 +1135,11 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
 
     def _games_won(c: dict) -> int:
         total = 0
-        for ls in (c.get("linescores") or []):
-            try: total += int(ls.get("value") or 0)
-            except (TypeError, ValueError): pass
+        for ls in c.get("linescores") or []:
+            try:
+                total += int(ls.get("value") or 0)
+            except (TypeError, ValueError):
+                pass
         return total
 
     c0_names = [_display_name(c0).lower()]
@@ -968,10 +1149,11 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
             obj = c.get(key) or {}
             for f in ("displayName", "shortDisplayName", "lastName", "abbreviation"):
                 v = obj.get(f)
-                if v: lst.append(v.lower())
+                if v:
+                    lst.append(v.lower())
 
-    market   = (bet.get("market") or "").lower()
-    pick_raw = (bet.get("pick")   or "").lower()
+    market = (bet.get("market") or "").lower()
+    pick_raw = (bet.get("pick") or "").lower()
     line_val = bet.get("line")
 
     if _name_matches(pick_raw, c0_names) or pick_raw == "home":
@@ -992,37 +1174,51 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
 
     if is_tennis:
         pick_score = _sets_won(pick_comp)
-        opp_score  = _sets_won(opp_comp)
-        c0_score   = _sets_won(c0)
-        c1_score   = _sets_won(c1)
+        opp_score = _sets_won(opp_comp)
+        c0_score = _sets_won(c0)
+        c1_score = _sets_won(c1)
         pick_total = _games_won(pick_comp)
-        opp_total  = _games_won(opp_comp)
+        opp_total = _games_won(opp_comp)
     else:
         pick_score = _get_score(pick_comp)
-        opp_score  = _get_score(opp_comp)
-        c0_score   = _get_score(c0)
-        c1_score   = _get_score(c1)
+        opp_score = _get_score(opp_comp)
+        c0_score = _get_score(c0)
+        c1_score = _get_score(c1)
         pick_total = pick_score
-        opp_total  = opp_score
+        opp_total = opp_score
 
     outcome = "pending"
     if market == "moneyline":
-        if pick_score > opp_score: outcome = "win"
-        elif pick_score < opp_score: outcome = "loss"
-        else: outcome = "push"
+        if pick_score > opp_score:
+            outcome = "win"
+        elif pick_score < opp_score:
+            outcome = "loss"
+        else:
+            outcome = "push"
     elif market in ("spread", "game spread", "puck_line", "run_line"):
         if line_val is not None:
             adj = pick_total + float(line_val)
-            if adj > opp_total: outcome = "win"
-            elif adj < opp_total: outcome = "loss"
-            else: outcome = "push"
+            if adj > opp_total:
+                outcome = "win"
+            elif adj < opp_total:
+                outcome = "loss"
+            else:
+                outcome = "push"
     elif market in ("total", "over_under", "total_goals", "total_runs"):
         total = c0_score + c1_score
         if line_val is not None:
             if pick_raw == "over":
-                outcome = "win" if total > float(line_val) else ("push" if total == float(line_val) else "loss")
+                outcome = (
+                    "win"
+                    if total > float(line_val)
+                    else ("push" if total == float(line_val) else "loss")
+                )
             else:
-                outcome = "win" if total < float(line_val) else ("push" if total == float(line_val) else "loss")
+                outcome = (
+                    "win"
+                    if total < float(line_val)
+                    else ("push" if total == float(line_val) else "loss")
+                )
     elif market == "both_teams_to_score":
         bts = c0_score > 0 and c1_score > 0
         if pick_raw in ("yes", "over"):
@@ -1031,13 +1227,19 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
             outcome = "win" if not bts else "loss"
 
     pick_name = _display_name(pick_comp)
-    opp_name  = _display_name(opp_comp)
+    opp_name = _display_name(opp_comp)
     return {
-        "outcome": outcome, "settled": True, "source": "espn_public",
+        "outcome": outcome,
+        "settled": True,
+        "source": "espn_public",
         "score": {
-            "home": c0_score, "away": c1_score, "total": c0_score + c1_score,
-            "pick_player": pick_name, "opp_player": opp_name,
-            "pick_score": pick_score, "opp_score": opp_score,
+            "home": c0_score,
+            "away": c1_score,
+            "total": c0_score + c1_score,
+            "pick_player": pick_name,
+            "opp_player": opp_name,
+            "pick_score": pick_score,
+            "opp_score": opp_score,
             "description": f"{pick_name} {pick_score} - {opp_score} {opp_name}",
         },
         "pricing": None,
@@ -1047,12 +1249,20 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
 async def _build_prop_settlement(bet: dict) -> dict:
     player = bet.get("player")
     if not player:
-        return {"outcome": "pending", "settled": False, "source": None,
-                "note": "Player name missing."}
+        return {
+            "outcome": "pending",
+            "settled": False,
+            "source": None,
+            "note": "Player name missing.",
+        }
     line = bet.get("line")
     if line is None:
-        return {"outcome": "pending", "settled": False, "source": None,
-                "note": "Line value missing for prop settlement."}
+        return {
+            "outcome": "pending",
+            "settled": False,
+            "source": None,
+            "note": "Line value missing for prop settlement.",
+        }
     event_id, home_team, away_team = await _resolve_game_for_bet(bet)
     primary_team = bet.get("team") or home_team
     try:
@@ -1074,19 +1284,32 @@ async def _build_prop_settlement(bet: dict) -> dict:
             try:
                 if bet.get("date"):
                     d = datetime.strptime(str(bet.get("date")), "%Y-%m-%d").date()
-                    retry_dates.extend([
-                        (d - timedelta(days=1)).isoformat(),
-                        (d + timedelta(days=1)).isoformat(),
-                    ])
+                    retry_dates.extend(
+                        [
+                            (d - timedelta(days=1)).isoformat(),
+                            (d + timedelta(days=1)).isoformat(),
+                        ]
+                    )
             except ValueError:
                 pass
 
             seen_dates: set[str | None] = set()
-            retry_dates = [d for d in retry_dates if not (d in seen_dates or seen_dates.add(d))]
+            retry_dates = [
+                d for d in retry_dates if not (d in seen_dates or seen_dates.add(d))
+            ]
 
-            team_variants: list[str | None] = [primary_team, home_team, away_team, bet.get("team")]
+            team_variants: list[str | None] = [
+                primary_team,
+                home_team,
+                away_team,
+                bet.get("team"),
+            ]
             seen_teams: set[str | None] = set()
-            team_variants = [t for t in team_variants if t and not (t in seen_teams or seen_teams.add(t))]
+            team_variants = [
+                t
+                for t in team_variants
+                if t and not (t in seen_teams or seen_teams.add(t))
+            ]
 
             sport_variants: list[str | None] = [bet.get("sport"), None]
 
@@ -1117,7 +1340,8 @@ async def _build_prop_settlement(bet: dict) -> dict:
                                     "outcome": "pending",
                                     "settled": False,
                                     "source": None,
-                                    "note": retry_exc.detail or "Stats service timed out. Retry settlement.",
+                                    "note": retry_exc.detail
+                                    or "Stats service timed out. Retry settlement.",
                                 }
                             return {
                                 "outcome": "unknown",
@@ -1142,19 +1366,35 @@ async def _build_prop_settlement(bet: dict) -> dict:
                 "note": exc.detail or "Stats service timed out. Retry settlement.",
             }
         else:
-            return {"outcome": "unknown", "settled": False, "source": None, "error": str(exc)}
+            return {
+                "outcome": "unknown",
+                "settled": False,
+                "source": None,
+                "error": str(exc),
+            }
     except Exception as exc:
-        return {"outcome": "unknown", "settled": False, "source": None, "error": str(exc)}
+        return {
+            "outcome": "unknown",
+            "settled": False,
+            "source": None,
+            "error": str(exc),
+        }
     outcome = result.get("outcome", "pending")
-    source  = result.get("source", "historical")
+    source = result.get("source", "historical")
     if outcome in {"win", "loss", "push"} and result.get("settled"):
         stat_value = result.get("stat_value")
         stat_name = result.get("market") or bet.get("market")
         home_score = result.get("home_score")
         away_score = result.get("away_score")
         await run_in_threadpool(
-            bet_tracking.settle_bet, bet["bet_id"], outcome, source,
-            home_score, away_score, stat_value, stat_name
+            bet_tracking.settle_bet,
+            bet["bet_id"],
+            outcome,
+            source,
+            home_score,
+            away_score,
+            stat_value,
+            stat_name,
         )
     return result
 
@@ -1177,15 +1417,23 @@ async def _build_settlement(bet: dict) -> dict:
     sport = (bet.get("sport") or "").lower()
     use_espn_period = (
         market in _PERIOD_SETTLEABLE
-        and sport != "soccer"   # soccer period markets route to SofaScore via _AUTO_SETTLEABLE
+        and sport
+        != "soccer"  # soccer period markets route to SofaScore via _AUTO_SETTLEABLE
         and not (sport == "baseball" and market in _MLB_MARKETCHECK_ROUTED)
     )
 
     if use_espn_period:
         result = await _espn_settle_period_bet(bet)
-        if result and result.get("outcome") in {"win", "loss", "push"} and result.get("settled"):
+        if (
+            result
+            and result.get("outcome") in {"win", "loss", "push"}
+            and result.get("settled")
+        ):
             await run_in_threadpool(
-                bet_tracking.settle_bet, bet["bet_id"], result["outcome"], "espn_public",
+                bet_tracking.settle_bet,
+                bet["bet_id"],
+                result["outcome"],
+                "espn_public",
                 (result.get("score") or {}).get("home"),
                 (result.get("score") or {}).get("away"),
             )
@@ -1194,8 +1442,12 @@ async def _build_settlement(bet: dict) -> dict:
 
     if market not in _AUTO_SETTLEABLE or not bet.get("pick"):
         return {
-            "outcome": "not_settleable", "settled": False, "source": None,
-            "score": None, "pricing": None, "espn_limitation": True,
+            "outcome": "not_settleable",
+            "settled": False,
+            "source": None,
+            "score": None,
+            "pricing": None,
+            "espn_limitation": True,
             "note": (
                 f"Market '{bet.get('market')}' requires period-specific data. "
                 f"Settle manually via POST /bets/{bet.get('bet_id')}/settle."
@@ -1203,17 +1455,28 @@ async def _build_settlement(bet: dict) -> dict:
         }
 
     if not sports_bridge.is_available():
-        return {"outcome": "unknown", "settled": False, "source": None,
-                "score": None, "pricing": None, "error": "stats service unavailable"}
+        return {
+            "outcome": "unknown",
+            "settled": False,
+            "source": None,
+            "score": None,
+            "pricing": None,
+            "error": "stats service unavailable",
+        }
 
     event_id, home_team, away_team = await _resolve_game_for_bet(bet)
-    query_team     = home_team or bet.get("team")
+    query_team = home_team or bet.get("team")
     query_opponent = away_team if home_team else None
 
     if not event_id and not (query_team and bet.get("date")):
-        return {"outcome": "pending", "settled": False, "source": None,
-                "score": None, "pricing": None,
-                "note": "Cannot locate game — provide date + team name or event_id."}
+        return {
+            "outcome": "pending",
+            "settled": False,
+            "source": None,
+            "score": None,
+            "pricing": None,
+            "note": "Cannot locate game — provide date + team name or event_id.",
+        }
 
     _market = market
     effective_pick, line_value = _spread_pick_and_line_for_settlement(bet)
@@ -1222,17 +1485,27 @@ async def _build_settlement(bet: dict) -> dict:
     # `player` field holds the target team name. Pass it as `team` so that
     # soccer_sofascore_props can pick the right side.
     _soccer_team_markets = {
-        "team_total", "team_total_corners",
-        "1st_half_team_total", "1st_half_team_total_corners",
-        "2nd_half_team_total", "2nd_half_team_total_corners",
+        "team_total",
+        "team_total_corners",
+        "1st_half_team_total",
+        "1st_half_team_total_corners",
+        "2nd_half_team_total",
+        "2nd_half_team_total_corners",
     }
-    if _market in _soccer_team_markets and bet.get("player") and bet.get("sport", "").lower() == "soccer":
+    if (
+        _market in _soccer_team_markets
+        and bet.get("player")
+        and bet.get("sport", "").lower() == "soccer"
+    ):
         query_team = bet["player"]
 
     # Normalise pick values that stats_api does not accept directly
     effective_pick = bet["pick"]
-    if _market in ("both_teams_to_score",
-                   "1st_half_both_teams_to_score", "2nd_half_both_teams_to_score"):
+    if _market in (
+        "both_teams_to_score",
+        "1st_half_both_teams_to_score",
+        "2nd_half_both_teams_to_score",
+    ):
         if effective_pick.lower() in ("over", "yes"):
             effective_pick = "yes"
         elif effective_pick.lower() in ("under", "no"):
@@ -1245,10 +1518,15 @@ async def _build_settlement(bet: dict) -> dict:
 
     try:
         result = await sports_bridge.market_check(
-            event_id=event_id, date=bet.get("date"), sport=bet.get("sport"),
-            team=query_team, opponent=query_opponent,
+            event_id=event_id,
+            date=bet.get("date"),
+            sport=bet.get("sport"),
+            team=query_team,
+            opponent=query_opponent,
             player=bet.get("player"),
-            market=_market, pick=effective_pick, line=line_value,
+            market=_market,
+            pick=effective_pick,
+            line=line_value,
         )
     except sports_bridge.StatsBridgeHTTPError as exc:
         if exc.status_code == 404:
@@ -1260,13 +1538,20 @@ async def _build_settlement(bet: dict) -> dict:
             try:
                 if bet.get("date"):
                     d = datetime.strptime(str(bet.get("date")), "%Y-%m-%d").date()
-                    retry_dates.extend([(d - timedelta(days=1)).isoformat(), (d + timedelta(days=1)).isoformat()])
+                    retry_dates.extend(
+                        [
+                            (d - timedelta(days=1)).isoformat(),
+                            (d + timedelta(days=1)).isoformat(),
+                        ]
+                    )
             except ValueError:
                 pass
 
             # preserve order while removing duplicates
             seen_dates: set[str | None] = set()
-            retry_dates = [d for d in retry_dates if not (d in seen_dates or seen_dates.add(d))]
+            retry_dates = [
+                d for d in retry_dates if not (d in seen_dates or seen_dates.add(d))
+            ]
 
             team_variants: list[tuple[str | None, str | None]] = [
                 (query_team, query_opponent),
@@ -1308,7 +1593,8 @@ async def _build_settlement(bet: dict) -> dict:
                                     "source": None,
                                     "score": None,
                                     "pricing": None,
-                                    "note": retry_exc.detail or "Stats service timed out. Retry settlement.",
+                                    "note": retry_exc.detail
+                                    or "Stats service timed out. Retry settlement.",
                                 }
                             return {
                                 "outcome": "unknown",
@@ -1325,16 +1611,27 @@ async def _build_settlement(bet: dict) -> dict:
                 fallback = await _espn_settle_bet(bet)
                 if fallback is not None:
                     fb_outcome = fallback.get("outcome", "pending")
-                    if fb_outcome in {"win", "loss", "push"} and fallback.get("settled"):
+                    if fb_outcome in {"win", "loss", "push"} and fallback.get(
+                        "settled"
+                    ):
                         fb_score = fallback.get("score") or {}
                         await run_in_threadpool(
-                            bet_tracking.settle_bet, bet["bet_id"], fb_outcome, "espn_public",
-                            fb_score.get("home"), fb_score.get("away"),
+                            bet_tracking.settle_bet,
+                            bet["bet_id"],
+                            fb_outcome,
+                            "espn_public",
+                            fb_score.get("home"),
+                            fb_score.get("away"),
                         )
                     return fallback
-                return {"outcome": "pending", "settled": False, "source": None,
-                        "score": None, "pricing": None,
-                        "note": "Game not found — may be in the future or not yet tracked."}
+                return {
+                    "outcome": "pending",
+                    "settled": False,
+                    "source": None,
+                    "score": None,
+                    "pricing": None,
+                    "note": "Game not found — may be in the future or not yet tracked.",
+                }
         if exc.status_code == 504:
             return {
                 "outcome": "pending",
@@ -1344,15 +1641,27 @@ async def _build_settlement(bet: dict) -> dict:
                 "pricing": None,
                 "note": exc.detail or "Stats service timed out. Retry settlement.",
             }
-        return {"outcome": "unknown", "settled": False, "source": None,
-                "score": None, "pricing": None, "error": str(exc)}
+        return {
+            "outcome": "unknown",
+            "settled": False,
+            "source": None,
+            "score": None,
+            "pricing": None,
+            "error": str(exc),
+        }
     except Exception as exc:
-        return {"outcome": "unknown", "settled": False, "source": None,
-                "score": None, "pricing": None, "error": str(exc)}
+        return {
+            "outcome": "unknown",
+            "settled": False,
+            "source": None,
+            "score": None,
+            "pricing": None,
+            "error": str(exc),
+        }
 
     outcome = result.get("outcome", "pending")
     settled = result.get("settled", False)
-    source  = result.get("source")
+    source = result.get("source")
 
     # stats_api market-check responses may return either:
     # - score: {home, away, total}
@@ -1366,14 +1675,22 @@ async def _build_settlement(bet: dict) -> dict:
     if outcome in {"win", "loss", "push"} and settled and source:
         await run_in_threadpool(
             bet_tracking.settle_bet,
-            bet["bet_id"], outcome, source,
-            score.get("home"), score.get("away"),
+            bet["bet_id"],
+            outcome,
+            source,
+            score.get("home"),
+            score.get("away"),
         )
 
-    return {"outcome": outcome, "settled": settled, "source": source,
-            "score": score if score else None, "pricing": result.get("pricing"),
-            "note": result.get("note"),
-            "event": result.get("event")}
+    return {
+        "outcome": outcome,
+        "settled": settled,
+        "source": source,
+        "score": score if score else None,
+        "pricing": result.get("pricing"),
+        "note": result.get("note"),
+        "event": result.get("event"),
+    }
 
 
 def _stored_settlement(bet: dict) -> dict:
@@ -1381,43 +1698,48 @@ def _stored_settlement(bet: dict) -> dict:
     hs = bet.get("home_score")
     as_ = bet.get("away_score")
     score = (
-        {"home": hs, "away": as_, "total": (hs + as_) if hs is not None and as_ is not None else None}
-        if hs is not None or as_ is not None else None
+        {
+            "home": hs,
+            "away": as_,
+            "total": (hs + as_) if hs is not None and as_ is not None else None,
+        }
+        if hs is not None or as_ is not None
+        else None
     )
     return {
-        "outcome":    bet.get("outcome") or status,
-        "settled":    status not in ("pending", "void"),
-        "source":     bet.get("settlement_source"),
+        "outcome": bet.get("outcome") or status,
+        "settled": status not in ("pending", "void"),
+        "source": bet.get("settlement_source"),
         "settled_at": bet.get("settled_at"),
-        "score":      score,
+        "score": score,
     }
 
 
 def _bet_response(bet: dict, settlement: dict | None = None) -> dict:
     return {
-        "bet_id":     bet["bet_id"],
+        "bet_id": bet["bet_id"],
         "created_at": bet["created_at"],
-        "email":      bet.get("email"),
-        "status":     bet["status"],
-        "sport":      bet.get("sport"),
-        "league":     bet.get("league"),
-        "date":       bet.get("date"),
-        "event":      bet.get("event"),
-        "datetime":   bet.get("event_datetime"),
-        "event_id":   bet.get("event_id"),
-        "team":       bet.get("team"),
-        "home_team":  bet.get("home_team"),
-        "away_team":  bet.get("away_team"),
-        "player":     bet.get("player"),
-        "market":     bet["market"],
-        "pick":       bet["pick"] or None,
+        "email": bet.get("email"),
+        "status": bet["status"],
+        "sport": bet.get("sport"),
+        "league": bet.get("league"),
+        "date": bet.get("date"),
+        "event": bet.get("event"),
+        "datetime": bet.get("event_datetime"),
+        "event_id": bet.get("event_id"),
+        "team": bet.get("team"),
+        "home_team": bet.get("home_team"),
+        "away_team": bet.get("away_team"),
+        "player": bet.get("player"),
+        "market": bet["market"],
+        "pick": bet["pick"] or None,
         "selection_line": bet.get("selection_line"),
-        "line":       bet.get("line"),
-        "odds":       bet.get("odds"),
-        "stake":      bet.get("stake"),
-        "notes":      bet.get("notes"),
-        "book":       bet.get("book"),
-        "settled_at":        bet.get("settled_at"),
+        "line": bet.get("line"),
+        "odds": bet.get("odds"),
+        "stake": bet.get("stake"),
+        "notes": bet.get("notes"),
+        "book": bet.get("book"),
+        "settled_at": bet.get("settled_at"),
         "settlement_source": bet.get("settlement_source"),
         "nvig_at_placement": bet.get("nvig_at_placement"),
         "book_clv":          bet.get("book_clv"),
@@ -1526,14 +1848,15 @@ async def _calculate_clv_for_bet(bet_id: str) -> None:
 # Root
 # ---------------------------------------------------------------------------
 
+
 @app.get("/")
 async def root():
     return {
-        "status":  "online",
+        "status": "online",
         "service": "Bet Tracking API",
         "version": "1.0.0",
-        "port":    int(os.getenv("API_PORT", "5002")),
-        "db":      bet_tracking.DB_PATH,
+        "port": int(os.getenv("API_PORT", "5002")),
+        "db": bet_tracking.DB_PATH,
     }
 
 
@@ -1546,10 +1869,11 @@ async def health():
 # Bets
 # ---------------------------------------------------------------------------
 
+
 @app.post("/bets", tags=["bets"])
 async def create_bet(
-    body:      CreateBetRequest = Body(...),
-    auth_user: Optional[dict]   = Depends(require_auth),
+    body: CreateBetRequest = Body(...),
+    auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
     # Cookie auth  → always use JWT email, ignore body.email
     # Bearer auth  → use body.email (service/script callers supply it)
@@ -1571,11 +1895,20 @@ async def create_bet(
 
     bet = await run_in_threadpool(
         bet_tracking.create_bet,
-        market=body.market, pick=body.pick, user_id=user_id,
-        sport=body.sport, league=body.league, date=body.date,
-        event=body.event, event_datetime=body.datetime, event_id=body.event_id,
-        team=body.team, home_team=body.home_team, away_team=body.away_team,
-        player=body.player, selection_line=_selection_line_for_storage(body),
+        market=body.market,
+        pick=body.pick,
+        user_id=user_id,
+        sport=body.sport,
+        league=body.league,
+        date=body.date,
+        event=body.event,
+        event_datetime=body.datetime,
+        event_id=body.event_id,
+        team=body.team,
+        home_team=body.home_team,
+        away_team=body.away_team,
+        player=body.player,
+        selection_line=_selection_line_for_storage(body),
         line=body.line if isinstance(body.line, (int, float)) else None,
         odds=body.odds, stake=body.stake, notes=body.notes, book=body.book,
         counterpart_odds=body.counterpart_odds, nvig_at_placement=nvig_at_placement,
@@ -1588,16 +1921,16 @@ async def create_bet(
 
 @app.get("/bets", tags=["bets"])
 async def list_bets(
-    status:    Optional[str] = Query(None),
-    sport:     Optional[str] = Query(None),
-    market:    Optional[str] = Query(None),
-    player:    Optional[str] = Query(None),
-    email:     Optional[str] = Query(None),
-    book:      Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    sport: Optional[str] = Query(None),
+    market: Optional[str] = Query(None),
+    player: Optional[str] = Query(None),
+    email: Optional[str] = Query(None),
+    book: Optional[str] = Query(None),
     date_from: Optional[str] = Query(None),
-    date_to:   Optional[str] = Query(None),
-    limit:     int           = Query(50, ge=1, le=200),
-    offset:    int           = Query(0,  ge=0),
+    date_to: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
     # Cookie / API key auth → always scope to token email, ignore ?email= param
@@ -1613,32 +1946,54 @@ async def list_bets(
             bet_tracking.get_user_by_email, resolved_email
         )
         if not db_user:
-            return JSONResponse({
-                "total": 0, "returned": 0, "offset": offset,
-                "limit": limit, "filters": {"email": resolved_email}, "bets": [],
-            })
+            return JSONResponse(
+                {
+                    "total": 0,
+                    "returned": 0,
+                    "offset": offset,
+                    "limit": limit,
+                    "filters": {"email": resolved_email},
+                    "bets": [],
+                }
+            )
         user_id = db_user["user_id"]
 
     bets, total = await run_in_threadpool(
         bet_tracking.list_bets,
-        status=status, sport=sport, market=market, player=player,
-        user_id=user_id, book=book, date_from=date_from, date_to=date_to,
-        limit=limit, offset=offset,
+        status=status,
+        sport=sport,
+        market=market,
+        player=player,
+        user_id=user_id,
+        book=book,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+        offset=offset,
     )
-    return JSONResponse({
-        "total": total, "returned": len(bets), "offset": offset, "limit": limit,
-        "filters": {
-            "status": status, "sport": sport, "market": market,
-            "player": player, "email": resolved_email,
-            "date_from": date_from, "date_to": date_to,
-        },
-        "bets": [_bet_response(b, _stored_settlement(b)) for b in bets],
-    })
+    return JSONResponse(
+        {
+            "total": total,
+            "returned": len(bets),
+            "offset": offset,
+            "limit": limit,
+            "filters": {
+                "status": status,
+                "sport": sport,
+                "market": market,
+                "player": player,
+                "email": resolved_email,
+                "date_from": date_from,
+                "date_to": date_to,
+            },
+            "bets": [_bet_response(b, _stored_settlement(b)) for b in bets],
+        }
+    )
 
 
 @app.get("/bets/summary", tags=["bets"])
 async def bets_summary(
-    email:     Optional[str] = Query(None),
+    email: Optional[str] = Query(None),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
     # Cookie / API key auth → always scope to token email
@@ -1664,7 +2019,7 @@ async def bets_summary(
 
 @app.get("/bets/analytics", tags=["bets"])
 async def bets_analytics(
-    email:     Optional[str] = Query(None),
+    email: Optional[str] = Query(None),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
     # Cookie / API key auth → always scope to token email
@@ -1682,10 +2037,12 @@ async def bets_analytics(
             analytics = await run_in_threadpool(
                 bet_tracking.get_user_analytics, db_user["user_id"]
             )
-            return JSONResponse({
-                "user": {"user_id": db_user["user_id"], "email": db_user["email"]},
-                **analytics,
-            })
+            return JSONResponse(
+                {
+                    "user": {"user_id": db_user["user_id"], "email": db_user["email"]},
+                    **analytics,
+                }
+            )
     analytics = await run_in_threadpool(bet_tracking.get_analytics)
     return JSONResponse(analytics)
 
@@ -1896,17 +2253,24 @@ async def settle_bet(
     if bet is None:
         raise HTTPException(status_code=404, detail=f"Bet {bet_id!r} not found")
     if bet["status"] != "pending":
-        return JSONResponse({
-            "message": f"Bet is already settled as '{bet['status']}'. No action taken.",
-            "bet": _bet_response(bet),
-        })
+        return JSONResponse(
+            {
+                "message": f"Bet is already settled as '{bet['status']}'. No action taken.",
+                "bet": _bet_response(bet),
+            }
+        )
     settlement = await _build_settlement(bet)
     if settlement.get("settled") and settlement.get("outcome") in {"win", "loss", "push"}:
         asyncio.ensure_future(_calculate_clv_for_bet(bet_id))
     fresh_bet = await run_in_threadpool(bet_tracking.get_bet, bet_id)
     if fresh_bet is not None:
         bet = fresh_bet
-    elif settlement.get("settled") and settlement.get("outcome") in {"win", "loss", "push", "void"}:
+    elif settlement.get("settled") and settlement.get("outcome") in {
+        "win",
+        "loss",
+        "push",
+        "void",
+    }:
         # Keep API response consistent even if immediate re-read fails.
         bet = {
             **bet,
@@ -1918,8 +2282,10 @@ async def settle_bet(
 
 
 class BulkSettleRequest(BaseModel):
-    email:    Optional[str] = Field(None, description="User email / Gmail address")
-    gmail_id: Optional[str] = Field(None, description="Alias for email (backward compat)")
+    email: Optional[str] = Field(None, description="User email / Gmail address")
+    gmail_id: Optional[str] = Field(
+        None, description="Alias for email (backward compat)"
+    )
 
     @model_validator(mode="after")
     def normalize(self) -> "BulkSettleRequest":
@@ -1932,8 +2298,8 @@ class BulkSettleRequest(BaseModel):
 
 @app.post("/bets/settle-pending", tags=["bets"])
 async def settle_pending_bets_for_user(
-    body:      BulkSettleRequest = Body(...),
-    auth_user: Optional[dict]    = Depends(require_auth),
+    body: BulkSettleRequest = Body(...),
+    auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
     # Cookie / API key auth → always use token email, ignore body.email
     # Bearer auth → use body.email (service/script callers supply it)
@@ -2004,10 +2370,12 @@ async def settle_pending_bets_for_user(
         else:
             summary["pending"] += 1
 
-    return JSONResponse({
-        "found": True,
-        "summary": summary,
-    })
+    return JSONResponse(
+        {
+            "found": True,
+            "summary": summary,
+        }
+    )
 
 
 class ManualSettleRequest(BaseModel):
@@ -2029,7 +2397,7 @@ class ManualSettleRequest(BaseModel):
 @app.patch("/bets/{bet_id}", tags=["bets"])
 async def manual_settle_bet(
     bet_id: str,
-    body:   ManualSettleRequest = Body(...),
+    body: ManualSettleRequest = Body(...),
     user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
     """Manually set the outcome of any pending bet."""
@@ -2047,8 +2415,11 @@ async def manual_settle_bet(
     else:
         updated = await run_in_threadpool(
             bet_tracking.settle_bet,
-            bet_id, body.outcome, "manual",
-            body.home_score, body.away_score,
+            bet_id,
+            body.outcome,
+            "manual",
+            body.home_score,
+            body.away_score,
         )
 
     bet = await run_in_threadpool(bet_tracking.get_bet, bet_id) or bet
@@ -2075,74 +2446,109 @@ async def delete_bet(
 # Users
 # ---------------------------------------------------------------------------
 
+
 @app.get("/users", tags=["users"])
 async def list_users(
-    limit:  int = Query(50, ge=1, le=200),
-    offset: int = Query(0,  ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
-    users, total = await run_in_threadpool(bet_tracking.list_users, limit=limit, offset=offset)
-    return JSONResponse({"total": total, "returned": len(users),
-                         "offset": offset, "limit": limit, "users": users})
+    users, total = await run_in_threadpool(
+        bet_tracking.list_users, limit=limit, offset=offset
+    )
+    return JSONResponse(
+        {
+            "total": total,
+            "returned": len(users),
+            "offset": offset,
+            "limit": limit,
+            "users": users,
+        }
+    )
 
 
 @app.get("/users/{email}/bets", tags=["users"])
 async def user_bets(
-    email:     str,
-    status:    Optional[str] = Query(None),
-    sport:     Optional[str] = Query(None),
-    market:    Optional[str] = Query(None),
+    email: str,
+    status: Optional[str] = Query(None),
+    sport: Optional[str] = Query(None),
+    market: Optional[str] = Query(None),
     date_from: Optional[str] = Query(None),
-    date_to:   Optional[str] = Query(None),
-    limit:     int           = Query(50, ge=1, le=200),
-    offset:    int           = Query(0,  ge=0),
+    date_to: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
     db_user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
     if not db_user:
-        raise HTTPException(status_code=404, detail=f"No user found for email '{email}'")
+        raise HTTPException(
+            status_code=404, detail=f"No user found for email '{email}'"
+        )
     bets, total = await run_in_threadpool(
         bet_tracking.list_bets,
-        status=status, sport=sport, market=market,
-        date_from=date_from, date_to=date_to,
-        user_id=db_user["user_id"], limit=limit, offset=offset,
+        status=status,
+        sport=sport,
+        market=market,
+        date_from=date_from,
+        date_to=date_to,
+        user_id=db_user["user_id"],
+        limit=limit,
+        offset=offset,
     )
-    return JSONResponse({
-        "user": {"user_id": db_user["user_id"], "email": db_user["email"],
-                 "created_at": db_user["created_at"]},
-        "total": total, "returned": len(bets), "offset": offset, "limit": limit,
-        "bets": [_bet_response(b) for b in bets],
-    })
+    return JSONResponse(
+        {
+            "user": {
+                "user_id": db_user["user_id"],
+                "email": db_user["email"],
+                "created_at": db_user["created_at"],
+            },
+            "total": total,
+            "returned": len(bets),
+            "offset": offset,
+            "limit": limit,
+            "bets": [_bet_response(b) for b in bets],
+        }
+    )
 
 
 @app.get("/users/{email}/stats", tags=["users"])
 async def user_stats(
-    email:     str,
+    email: str,
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
     db_user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
     if not db_user:
-        raise HTTPException(status_code=404, detail=f"No user found for email '{email}'")
+        raise HTTPException(
+            status_code=404, detail=f"No user found for email '{email}'"
+        )
     summary = await run_in_threadpool(bet_tracking.get_user_summary, db_user["user_id"])
-    return JSONResponse({
-        "user": {"user_id": db_user["user_id"], "email": db_user["email"]},
-        **summary,
-    })
+    return JSONResponse(
+        {
+            "user": {"user_id": db_user["user_id"], "email": db_user["email"]},
+            **summary,
+        }
+    )
 
 
 @app.get("/users/{email}/analytics", tags=["users"])
 async def user_analytics(
-    email:     str,
+    email: str,
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
     db_user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
     if not db_user:
-        raise HTTPException(status_code=404, detail=f"No user found for email '{email}'")
-    analytics = await run_in_threadpool(bet_tracking.get_user_analytics, db_user["user_id"])
-    return JSONResponse({
-        "user": {"user_id": db_user["user_id"], "email": db_user["email"]},
-        **analytics,
-    })
+        raise HTTPException(
+            status_code=404, detail=f"No user found for email '{email}'"
+        )
+    analytics = await run_in_threadpool(
+        bet_tracking.get_user_analytics, db_user["user_id"]
+    )
+    return JSONResponse(
+        {
+            "user": {"user_id": db_user["user_id"], "email": db_user["email"]},
+            **analytics,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
