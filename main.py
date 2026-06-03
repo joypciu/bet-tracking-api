@@ -437,7 +437,7 @@ _AUTO_SETTLEABLE = {
     # MMA markets
     "go_the_distance",
     "total_rounds",
-    # ── Tennis — set-level and match-level markets (settled via SofaScore) ──
+    # ── Tennis — set-level and match-level markets  (settled via SofaScore) ──
     "game_spread",
     "total_games",
     "total_sets",
@@ -530,7 +530,9 @@ def _normalize_settlement_market(market: str) -> str:
     return m
 
 
-_SPREAD_CORE_MARKETS = frozenset({"spread", "puck_line", "run_line",  "set_handicap", "game_spread"})
+_SPREAD_CORE_MARKETS = frozenset(
+    {"spread", "puck_line", "run_line", "set_handicap", "game_spread"}
+)
 _SPREAD_PICK_RE = re.compile(r"^(?P<team>.+?)\s+(?P<spread>[+-]?\d+(?:\.\d+)?)$")
 
 
