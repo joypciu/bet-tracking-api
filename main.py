@@ -448,6 +448,27 @@ _AUTO_SETTLEABLE = {
     "1st_set_will_there_be_a_tiebreak",
     "2nd_set_moneyline",
     "2nd_set_total_games",
+    # ── Hockey — full-game (settled via SofaScore through stats_api) ──────────
+    "both_teams_to_score_reg_time",
+    # ── Hockey — 1st period ───────────────────────────────────────────────────
+    "1st_period_moneyline",  # ESPN fallback; SofaScore primary
+    "1st_period_total_goals",  # ESPN fallback; SofaScore primary
+    "1st_period_puck_line",
+    "1st_period_total_goals_odd_even",
+    "1st_period_team_total",
+    "1st_period_both_teams_to_score",
+    # ── Hockey — 2nd period ───────────────────────────────────────────────────
+    "2nd_period_moneyline",  # ESPN fallback; SofaScore primary
+    "2nd_period_total_goals",  # ESPN fallback; SofaScore primary
+    "2nd_period_puck_line",
+    "2nd_period_total_goals_odd_even",
+    "2nd_period_team_total",
+    "2nd_period_both_teams_to_score",
+    # ── Hockey — 3rd period ───────────────────────────────────────────────────
+    "3rd_period_moneyline",
+    "3rd_period_puck_line",
+    "3rd_period_total_goals",
+    "3rd_period_total_goals_odd_even",
 }
 
 # MLB period markets that should settle via stats_api market-check (Savant /gf)
@@ -1520,6 +1541,9 @@ async def _build_settlement(bet: dict) -> dict:
         "both_teams_to_score",
         "1st_half_both_teams_to_score",
         "2nd_half_both_teams_to_score",
+        "both_teams_to_score_reg_time",
+        "1st_period_both_teams_to_score",
+        "2nd_period_both_teams_to_score",
     ):
         if effective_pick.lower() in ("over", "yes"):
             effective_pick = "yes"
