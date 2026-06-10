@@ -325,110 +325,10 @@ def init_db() -> None:
         )
         con.execute("CREATE INDEX IF NOT EXISTS idx_user_bets_date ON user_bets(date)")
 
-        # One-time backfill from legacy bets table.
-        con.execute("""
-            INSERT OR IGNORE INTO user_bets (
-                bet_id, created_at, user_id, shared_bet_id,
-                sport, league, date, event, event_datetime, event_id,
-                team, home_team, away_team, player,
-                market, pick, selection_line, line,
-                odds, stake, notes, status, outcome, settled_at,
-                settlement_source, book, home_score, away_score,
-                player_stat_value, stat_name,
-                counterpart_odds, nvig_at_placement,
-                book_clv, nvig_clv, clv_calculated_at
-            )
-            SELECT
-                bet_id, created_at, user_id, shared_bet_id,
-                sport, league, date, event, event_datetime, event_id,
-                team, home_team, away_team, player,
-                market, pick, selection_line, line,
-                odds, stake, notes, status, outcome, settled_at,
-                settlement_source, book, home_score, away_score,
-                player_stat_value, stat_name,
-                counterpart_odds, nvig_at_placement,
-                book_clv, nvig_clv, clv_calculated_at
-            FROM bets
-            """)
-
-        # Keep user_bets synchronized while write paths still use bets.
-        con.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_bets_ai_sync_user_bets
-            AFTER INSERT ON bets
-            BEGIN
-                INSERT INTO user_bets (
-                    bet_id, created_at, user_id, shared_bet_id,
-                    sport, league, date, event, event_datetime, event_id,
-                    team, home_team, away_team, player,
-                    market, pick, selection_line, line,
-                    odds, stake, notes, status, outcome, settled_at,
-                    settlement_source, book, home_score, away_score,
-                    player_stat_value, stat_name,
-                    counterpart_odds, nvig_at_placement,
-                    book_clv, nvig_clv, clv_calculated_at
-                ) VALUES (
-                    NEW.bet_id, NEW.created_at, NEW.user_id, NEW.shared_bet_id,
-                    NEW.sport, NEW.league, NEW.date, NEW.event, NEW.event_datetime, NEW.event_id,
-                    NEW.team, NEW.home_team, NEW.away_team, NEW.player,
-                    NEW.market, NEW.pick, NEW.selection_line, NEW.line,
-                    NEW.odds, NEW.stake, NEW.notes, NEW.status, NEW.outcome, NEW.settled_at,
-                    NEW.settlement_source, NEW.book, NEW.home_score, NEW.away_score,
-                    NEW.player_stat_value, NEW.stat_name,
-                    NEW.counterpart_odds, NEW.nvig_at_placement,
-                    NEW.book_clv, NEW.nvig_clv, NEW.clv_calculated_at
-                );
-            END
-            """)
-        con.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_bets_au_sync_user_bets
-            AFTER UPDATE ON bets
-            BEGIN
-                UPDATE user_bets
-                SET
-                    created_at = NEW.created_at,
-                    user_id = NEW.user_id,
-                    shared_bet_id = NEW.shared_bet_id,
-                    sport = NEW.sport,
-                    league = NEW.league,
-                    date = NEW.date,
-                    event = NEW.event,
-                    event_datetime = NEW.event_datetime,
-                    event_id = NEW.event_id,
-                    team = NEW.team,
-                    home_team = NEW.home_team,
-                    away_team = NEW.away_team,
-                    player = NEW.player,
-                    market = NEW.market,
-                    pick = NEW.pick,
-                    selection_line = NEW.selection_line,
-                    line = NEW.line,
-                    odds = NEW.odds,
-                    stake = NEW.stake,
-                    notes = NEW.notes,
-                    status = NEW.status,
-                    outcome = NEW.outcome,
-                    settled_at = NEW.settled_at,
-                    settlement_source = NEW.settlement_source,
-                    book = NEW.book,
-                    home_score = NEW.home_score,
-                    away_score = NEW.away_score,
-                    player_stat_value = NEW.player_stat_value,
-                    stat_name = NEW.stat_name,
-                    counterpart_odds = NEW.counterpart_odds,
-                    nvig_at_placement = NEW.nvig_at_placement,
-                    book_clv = NEW.book_clv,
-                    nvig_clv = NEW.nvig_clv,
-                    clv_calculated_at = NEW.clv_calculated_at
-                WHERE bet_id = NEW.bet_id;
-            END
-            """)
-        con.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_bets_ad_sync_user_bets
-            AFTER DELETE ON bets
-            BEGIN
-                DELETE FROM user_bets WHERE bet_id = OLD.bet_id;
-            END
-            """)
+        # Drop synchronization triggers if they exist.
+        con.execute("DROP TRIGGER IF EXISTS trg_bets_ai_sync_user_bets")
+        con.execute("DROP TRIGGER IF EXISTS trg_bets_au_sync_user_bets")
+        con.execute("DROP TRIGGER IF EXISTS trg_bets_ad_sync_user_bets")
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS api_users (
@@ -865,7 +765,7 @@ def create_bet(
         )
         con.execute(
             """
-            INSERT INTO bets
+            INSERT INTO user_bets
                 (bet_id, created_at, user_id, sport, league, date, event, event_datetime,
                  event_id, team, home_team, away_team, player, market, pick,
                  selection_line, line, odds, stake, notes, book,
@@ -911,7 +811,7 @@ def create_bet(
         ):
             con.execute(
                 """
-                UPDATE bets
+                UPDATE user_bets
                 SET outcome = ?, status = ?, settled_at = ?, settlement_source = ?,
                     home_score = ?, away_score = ?, player_stat_value = ?, stat_name = ?
                 WHERE bet_id = ? AND status = 'pending'
@@ -1002,7 +902,7 @@ def settle_bet(
     settled_at = datetime.now(timezone.utc).isoformat()
     with _conn() as con:
         bet_row = con.execute(
-            "SELECT bet_id, shared_bet_id, status FROM bets WHERE bet_id = ?",
+            "SELECT bet_id, shared_bet_id, status FROM user_bets WHERE bet_id = ?",
             (bet_id,),
         ).fetchone()
         if not bet_row:
@@ -1014,7 +914,7 @@ def settle_bet(
         if source == "manual" or not shared_bet_id:
             cur = con.execute(
                 """
-                UPDATE bets
+                UPDATE user_bets
                 SET    outcome = ?, status = ?, settled_at = ?,
                        settlement_source = ?, home_score = ?, away_score = ?,
                        player_stat_value = ?, stat_name = ?
@@ -1071,7 +971,7 @@ def settle_bet(
 
         cur = con.execute(
             """
-            UPDATE bets
+            UPDATE user_bets
             SET    outcome = ?, status = ?, settled_at = ?,
                    settlement_source = ?, home_score = ?, away_score = ?,
                    player_stat_value = ?, stat_name = ?
@@ -1112,7 +1012,7 @@ def update_bet_clv(
     with _conn() as con:
         con.execute(
             """
-            UPDATE bets
+            UPDATE user_bets
             SET book_clv = ?, nvig_clv = ?, clv_calculated_at = ?
             WHERE bet_id = ?
             """,
@@ -1125,7 +1025,7 @@ def void_bet(bet_id: str) -> bool:
     with _conn() as con:
         cur = con.execute(
             """
-            UPDATE bets
+            UPDATE user_bets
             SET status = 'void', outcome = 'void', settled_at = ?
             WHERE bet_id = ? AND status = 'pending'
             """,
@@ -1136,7 +1036,7 @@ def void_bet(bet_id: str) -> bool:
 
 def delete_bet(bet_id: str) -> bool:
     with _conn() as con:
-        cur = con.execute("DELETE FROM bets WHERE bet_id = ?", (bet_id,))
+        cur = con.execute("DELETE FROM user_bets WHERE bet_id = ?", (bet_id,))
         return cur.rowcount > 0
 
 
