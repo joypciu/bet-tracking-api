@@ -1446,6 +1446,26 @@ async def _build_settlement(bet: dict) -> dict:
             "note": "Game has not started yet.",
         }
 
+    shared_bet_id = bet.get("shared_bet_id")
+    if shared_bet_id:
+        cached = await run_in_threadpool(
+            bet_tracking.get_shared_settlement, shared_bet_id
+        )
+        if cached:
+            cached_resp = _shared_settlement_response(cached)
+            cached_outcome = cached_resp.get("outcome")
+            if cached_outcome in {"win", "loss", "push", "void"}:
+                if bet.get("status") == "pending":
+                    await run_in_threadpool(
+                        bet_tracking.settle_bet,
+                        bet["bet_id"],
+                        str(cached_outcome),
+                        cached_resp.get("source") or "shared_cache",
+                        (cached_resp.get("score") or {}).get("home"),
+                        (cached_resp.get("score") or {}).get("away"),
+                    )
+                return cached_resp
+
     if _is_prop_market(bet.get("market", "")):
         return await _build_prop_settlement(bet)
 
@@ -1754,6 +1774,50 @@ def _stored_settlement(bet: dict) -> dict:
     }
 
 
+def _is_auto_settleable_bet(bet: dict) -> bool:
+    market = _normalize_settlement_market(bet.get("market") or "")
+    sport = (bet.get("sport") or "").lower()
+
+    use_espn_period = (
+        market in _PERIOD_SETTLEABLE
+        and sport != "soccer"
+        and not (sport == "baseball" and market in _MLB_MARKETCHECK_ROUTED)
+    )
+    if use_espn_period:
+        return True
+
+    if _is_prop_market(bet.get("market", "")):
+        return bool(bet.get("player")) and (bet.get("line") is not None)
+
+    return market in _AUTO_SETTLEABLE and bool(bet.get("pick"))
+
+
+def _shared_settlement_response(shared: dict) -> dict:
+    status = shared.get("status")
+    outcome = shared.get("outcome") or status or "pending"
+    hs = shared.get("home_score")
+    as_ = shared.get("away_score")
+    score = (
+        {
+            "home": hs,
+            "away": as_,
+            "total": (hs + as_) if hs is not None and as_ is not None else None,
+        }
+        if hs is not None or as_ is not None
+        else None
+    )
+    return {
+        "outcome": outcome,
+        "settled": outcome in {"win", "loss", "push", "void"}
+        or bool(shared.get("settled")),
+        "source": shared.get("source"),
+        "settled_at": shared.get("settled_at"),
+        "score": score,
+        "pricing": None,
+        "note": "Loaded from shared settlement cache.",
+    }
+
+
 def _bet_response(bet: dict, settlement: dict | None = None) -> dict:
     return {
         "bet_id": bet["bet_id"],
@@ -1961,6 +2025,9 @@ async def create_bet(
         nvig_at_placement=nvig_at_placement,
     )
     settlement = await _build_settlement(bet)
+    refreshed = await run_in_threadpool(bet_tracking.get_bet, bet["bet_id"])
+    if refreshed is not None:
+        bet = refreshed
     if settlement.get("settled") and settlement.get("outcome") in {
         "win",
         "loss",
@@ -2538,6 +2605,15 @@ async def manual_settle_bet(
         raise HTTPException(
             status_code=409,
             detail=f"Bet is already settled as '{bet['status']}'. Cannot override a settled bet.",
+        )
+
+    if _is_auto_settleable_bet(bet):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Manual settlement is disabled for auto-settleable bets. "
+                "Use POST /bets/{bet_id}/settle instead."
+            ),
         )
 
     if body.outcome == "void":
