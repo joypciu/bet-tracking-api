@@ -2249,6 +2249,7 @@ async def bets_prop_markets(
                 "player_yellow_cards",
                 "player_goals_hockey",
                 "player_assists_hockey",
+                "player_power_play_points",
                 "player_hits",
                 "player_rbis",
                 "player_runs",
