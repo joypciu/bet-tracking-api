@@ -102,6 +102,23 @@ def _compute_nvig_ev(
         return None
 
 
+def _compute_nvig_ev_multi(
+    bet_odds: int, pick_odds: int, counterpart_odds: list[int]
+) -> float | None:
+    """EV% using no-vig fair probability for two-way or multi-way markets."""
+    try:
+        bet_dec = _american_to_decimal(bet_odds)
+        pick_prob = 1.0 / _american_to_decimal(pick_odds)
+        total = pick_prob + sum(
+            1.0 / _american_to_decimal(odds) for odds in counterpart_odds
+        )
+        if total <= 0:
+            return None
+        return round((pick_prob / total) * bet_dec - 1.0, 4)
+    except (ZeroDivisionError, ValueError, TypeError):
+        return None
+
+
 def _compute_book_clv(bet_odds: int, closing_pick_odds: int) -> float | None:
     """% gain vs closing raw odds (positive = you beat the closing line)."""
     try:
@@ -1901,17 +1918,22 @@ async def _calculate_clv_for_bet(bet_id: str) -> None:
         closing: dict = history_data.get("closing") or {}
         if not closing:
             return
+        if (history_data.get("provider") or "").lower() == "generated":
+            return
 
         # Resolve which closing odds field corresponds to this pick
         pick_raw = (bet.get("pick") or "").lower().strip()
         pick_clean = re.sub(r"\s+[+-]?\d+\.?\d*$", "", pick_raw).strip()
         market = (bet.get("market") or "").lower().strip()
-        uses_spread_price = market in {"spread", "puck_line", "run_line"} or (
-            "spread" in market
-        )
+        moneyline_markets = {"moneyline", "match_winner", "three_way_moneyline"}
+        spread_markets = {"spread", "puck_line", "run_line"}
+        total_markets = {"total", "total_points", "total_goals", "total_runs"}
+        if market not in moneyline_markets | spread_markets | total_markets:
+            return
+        uses_spread_price = market in spread_markets
 
         pick_closing: int | None = None
-        ctr_closing: int | None = None
+        counterpart_closing: list[int] = []
 
         def _matches_team(*names: str | None) -> bool:
             pick_norm = re.sub(r"[^a-z0-9]", "", pick_clean)
@@ -1926,17 +1948,38 @@ async def _calculate_clv_for_bet(bet_id: str) -> None:
             return False
 
         if pick_clean == "over":
+            if market not in total_markets:
+                return
             pick_closing = closing.get("over_odds")
-            ctr_closing = closing.get("under_odds")
+            counterpart_closing = [closing.get("under_odds")]
         elif pick_clean == "under":
+            if market not in total_markets:
+                return
             pick_closing = closing.get("under_odds")
-            ctr_closing = closing.get("over_odds")
+            counterpart_closing = [closing.get("over_odds")]
         elif pick_clean == "home":
-            pick_closing = closing.get("home_ml")
-            ctr_closing = closing.get("away_ml")
+            pick_closing = closing.get(
+                "home_spread_odds" if uses_spread_price else "home_ml"
+            )
+            counterpart_closing = [
+                closing.get("away_spread_odds" if uses_spread_price else "away_ml")
+            ]
+            if not uses_spread_price:
+                counterpart_closing.append(closing.get("draw_odds"))
         elif pick_clean == "away":
-            pick_closing = closing.get("away_ml")
-            ctr_closing = closing.get("home_ml")
+            pick_closing = closing.get(
+                "away_spread_odds" if uses_spread_price else "away_ml"
+            )
+            counterpart_closing = [
+                closing.get("home_spread_odds" if uses_spread_price else "home_ml")
+            ]
+            if not uses_spread_price:
+                counterpart_closing.append(closing.get("draw_odds"))
+        elif pick_clean in {"draw", "tie"}:
+            if market not in moneyline_markets:
+                return
+            pick_closing = closing.get("draw_odds")
+            counterpart_closing = [closing.get("home_ml"), closing.get("away_ml")]
         else:
             if _matches_team(
                 bet.get("home_team"),
@@ -1946,9 +1989,13 @@ async def _calculate_clv_for_bet(bet_id: str) -> None:
                 pick_closing = closing.get(
                     "home_spread_odds" if uses_spread_price else "home_ml"
                 )
-                ctr_closing = closing.get(
-                    "away_spread_odds" if uses_spread_price else "away_ml"
-                )
+                counterpart_closing = [
+                    closing.get(
+                        "away_spread_odds" if uses_spread_price else "away_ml"
+                    )
+                ]
+                if not uses_spread_price:
+                    counterpart_closing.append(closing.get("draw_odds"))
             elif _matches_team(
                 bet.get("away_team"),
                 history_data.get("away_team"),
@@ -1957,27 +2004,51 @@ async def _calculate_clv_for_bet(bet_id: str) -> None:
                 pick_closing = closing.get(
                     "away_spread_odds" if uses_spread_price else "away_ml"
                 )
-                ctr_closing = closing.get(
-                    "home_spread_odds" if uses_spread_price else "home_ml"
-                )
+                counterpart_closing = [
+                    closing.get(
+                        "home_spread_odds" if uses_spread_price else "home_ml"
+                    )
+                ]
+                if not uses_spread_price:
+                    counterpart_closing.append(closing.get("draw_odds"))
 
         if pick_closing is None:
             return
+
+        bet_line = bet.get("line")
+        if market in total_markets and bet_line is not None:
+            closing_line = closing.get("game_total")
+            if closing_line is None or abs(float(bet_line) - float(closing_line)) > 1e-9:
+                return
+        if uses_spread_price and bet_line is not None:
+            pick_is_home = _matches_team(
+                bet.get("home_team"),
+                history_data.get("home_team"),
+                history_data.get("home_abbr"),
+            )
+            closing_line = closing.get(
+                "home_spread" if pick_is_home else "away_spread"
+            )
+            if closing_line is None or abs(float(bet_line) - float(closing_line)) > 1e-9:
+                return
 
         try:
             pick_closing = int(pick_closing)
         except (ValueError, TypeError):
             return
-        if ctr_closing is not None:
+        clean_counterparts: list[int] = []
+        for odds in counterpart_closing:
+            if odds is None:
+                continue
             try:
-                ctr_closing = int(ctr_closing)
+                clean_counterparts.append(int(odds))
             except (ValueError, TypeError):
-                ctr_closing = None
+                continue
 
         book_clv = _compute_book_clv(bet_odds, pick_closing)
         nvig_clv = (
-            _compute_nvig_ev(bet_odds, pick_closing, ctr_closing)
-            if ctr_closing is not None
+            _compute_nvig_ev_multi(bet_odds, pick_closing, clean_counterparts)
+            if clean_counterparts
             else None
         )
         await run_in_threadpool(bet_tracking.update_bet_clv, bet_id, book_clv, nvig_clv)
