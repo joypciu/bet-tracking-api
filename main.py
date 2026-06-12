@@ -2467,7 +2467,6 @@ async def get_bet(
         settlement = _stored_settlement(bet)
         if (
             bet.get("book_clv") is None
-            and bet.get("event_id")
             and bet["status"] in {"win", "loss", "push"}
         ):
             asyncio.ensure_future(_calculate_clv_for_bet(bet_id))
