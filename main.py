@@ -1884,11 +1884,17 @@ async def _calculate_clv_for_bet(bet_id: str) -> None:
             return
         event_id = bet.get("event_id")
         bet_odds = bet.get("odds")
-        if not event_id or not bet_odds:
+        if not bet_odds:
             return
 
         try:
-            history_data = await sports_bridge.fetch_odds_history(event_id)
+            history_data = await sports_bridge.fetch_odds_history(
+                event_id=event_id,
+                date=bet.get("date"),
+                sport=bet.get("sport"),
+                team=bet.get("home_team") or bet.get("team"),
+                opponent=bet.get("away_team"),
+            )
         except Exception:
             return
 
@@ -1899,9 +1905,25 @@ async def _calculate_clv_for_bet(bet_id: str) -> None:
         # Resolve which closing odds field corresponds to this pick
         pick_raw = (bet.get("pick") or "").lower().strip()
         pick_clean = re.sub(r"\s+[+-]?\d+\.?\d*$", "", pick_raw).strip()
+        market = (bet.get("market") or "").lower().strip()
+        uses_spread_price = market in {"spread", "puck_line", "run_line"} or (
+            "spread" in market
+        )
 
         pick_closing: int | None = None
         ctr_closing: int | None = None
+
+        def _matches_team(*names: str | None) -> bool:
+            pick_norm = re.sub(r"[^a-z0-9]", "", pick_clean)
+            for name in names:
+                name_norm = re.sub(r"[^a-z0-9]", "", (name or "").lower())
+                if pick_norm and name_norm and (
+                    pick_norm == name_norm
+                    or pick_norm in name_norm
+                    or name_norm in pick_norm
+                ):
+                    return True
+            return False
 
         if pick_clean == "over":
             pick_closing = closing.get("over_odds")
@@ -1916,14 +1938,28 @@ async def _calculate_clv_for_bet(bet_id: str) -> None:
             pick_closing = closing.get("away_ml")
             ctr_closing = closing.get("home_ml")
         else:
-            home = (bet.get("home_team") or "").lower()
-            away = (bet.get("away_team") or "").lower()
-            if home and (pick_clean in home or home in pick_clean):
-                pick_closing = closing.get("home_ml")
-                ctr_closing = closing.get("away_ml")
-            elif away and (pick_clean in away or away in pick_clean):
-                pick_closing = closing.get("away_ml")
-                ctr_closing = closing.get("home_ml")
+            if _matches_team(
+                bet.get("home_team"),
+                history_data.get("home_team"),
+                history_data.get("home_abbr"),
+            ):
+                pick_closing = closing.get(
+                    "home_spread_odds" if uses_spread_price else "home_ml"
+                )
+                ctr_closing = closing.get(
+                    "away_spread_odds" if uses_spread_price else "away_ml"
+                )
+            elif _matches_team(
+                bet.get("away_team"),
+                history_data.get("away_team"),
+                history_data.get("away_abbr"),
+            ):
+                pick_closing = closing.get(
+                    "away_spread_odds" if uses_spread_price else "away_ml"
+                )
+                ctr_closing = closing.get(
+                    "home_spread_odds" if uses_spread_price else "home_ml"
+                )
 
         if pick_closing is None:
             return
