@@ -2538,7 +2538,7 @@ async def get_bet(
         settlement = _stored_settlement(bet)
         if (
             bet.get("book_clv") is None
-            and bet["status"] in {"win", "loss", "push"}
+            and bet["status"] in {"win", "loss", "push", "void"}
         ):
             asyncio.ensure_future(_calculate_clv_for_bet(bet_id))
     return JSONResponse(_bet_response(bet, settlement))
@@ -2661,7 +2661,7 @@ async def settle_pending_bets_for_user(
         outcome = str(settlement.get("outcome") or "pending")
         settled = bool(settlement.get("settled"))
 
-        if outcome in {"win", "loss", "push"}:
+        if outcome in {"win", "loss", "push", "void"}:
             asyncio.ensure_future(_calculate_clv_for_bet(bet["bet_id"]))
 
         if outcome in {"win", "loss", "push", "void"}:
@@ -2734,6 +2734,9 @@ async def manual_settle_bet(
             body.home_score,
             body.away_score,
         )
+
+    if updated:
+        asyncio.ensure_future(_calculate_clv_for_bet(bet_id))
 
     bet = await run_in_threadpool(bet_tracking.get_bet, bet_id) or bet
     settlement = {
