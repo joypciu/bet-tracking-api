@@ -202,6 +202,7 @@ def init_db() -> None:
             ("book_clv", "REAL"),
             ("nvig_clv", "REAL"),
             ("clv_calculated_at", "TEXT"),
+            ("historics_context", "TEXT"),
         ]:
             if col not in cols:
                 con.execute(f"ALTER TABLE bets ADD COLUMN {col} {typ}")
@@ -311,7 +312,8 @@ def init_db() -> None:
                 nvig_at_placement  REAL,
                 book_clv           REAL,
                 nvig_clv           REAL,
-                clv_calculated_at  TEXT
+                clv_calculated_at  TEXT,
+                historics_context  TEXT
             )
             """)
         con.execute(
@@ -324,6 +326,13 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_user_bets_status ON user_bets(status)"
         )
         con.execute("CREATE INDEX IF NOT EXISTS idx_user_bets_date ON user_bets(date)")
+
+        ub_cols = {
+            row["name"]
+            for row in con.execute("PRAGMA table_info(user_bets)").fetchall()
+        }
+        if "historics_context" not in ub_cols:
+            con.execute("ALTER TABLE user_bets ADD COLUMN historics_context TEXT")
 
         # Drop synchronization triggers if they exist.
         con.execute("DROP TRIGGER IF EXISTS trg_bets_ai_sync_user_bets")
@@ -741,6 +750,7 @@ def create_bet(
     book: str | None = None,
     counterpart_odds: int | None = None,
     nvig_at_placement: float | None = None,
+    historics_context: str | None = None,
 ) -> dict[str, Any]:
     bet_id = str(uuid.uuid4())
     created_at = datetime.now(timezone.utc).isoformat()
@@ -769,8 +779,8 @@ def create_bet(
                 (bet_id, created_at, user_id, sport, league, date, event, event_datetime,
                  event_id, team, home_team, away_team, player, market, pick,
                  selection_line, line, odds, stake, notes, book,
-                 counterpart_odds, nvig_at_placement, shared_bet_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 counterpart_odds, nvig_at_placement, historics_context, shared_bet_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 bet_id,
@@ -796,6 +806,7 @@ def create_bet(
                 book,
                 counterpart_odds,
                 nvig_at_placement,
+                historics_context,
                 shared_bet_id,
             ),
         )

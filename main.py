@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_valid
 load_dotenv()
 
 import bet_tracking
+import historics_bridge
 import sports_bridge
 from auth import require_auth, router as auth_router
 from admin import router as admin_router
@@ -102,19 +103,12 @@ def _compute_nvig_ev(
         return None
 
 
-def _compute_nvig_ev_multi(
-    bet_odds: int, pick_odds: int, counterpart_odds: list[int]
-) -> float | None:
-    """EV% using no-vig fair probability for two-way or multi-way markets."""
+def _compute_nvig_clv_from_fair(bet_odds: int, nvig_odds: int) -> float | None:
+    """EV% vs closing fair nvig line (same idea as EV feed get_ev_from_price)."""
     try:
         bet_dec = _american_to_decimal(bet_odds)
-        pick_prob = 1.0 / _american_to_decimal(pick_odds)
-        total = pick_prob + sum(
-            1.0 / _american_to_decimal(odds) for odds in counterpart_odds
-        )
-        if total <= 0:
-            return None
-        return round((pick_prob / total) * bet_dec - 1.0, 4)
+        fair_prob = 1.0 / _american_to_decimal(nvig_odds)
+        return round(fair_prob * bet_dec - 1.0, 4)
     except (ZeroDivisionError, ValueError, TypeError):
         return None
 
@@ -158,6 +152,10 @@ class CreateBetRequest(BaseModel):
     counterpart_odds: Optional[int] = Field(
         None,
         description="Other side's American odds at placement — enables nvig_at_placement EV calculation",
+    )
+    historics_context: Optional[str] = Field(
+        None,
+        description="JWT from EV feed data-historics — used to compute CLV after settlement",
     )
 
     _raw_line: Optional[str] = PrivateAttr(default=None)
@@ -1886,172 +1884,87 @@ def _selection_line_for_storage(body: CreateBetRequest) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# CLV background calculator
+# CLV background calculator (EV feed historics)
 # ---------------------------------------------------------------------------
+
+
+def _normalize_book_key(name: str | None) -> str:
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def _last_american_odds(series: list | None) -> int | None:
+    if not series:
+        return None
+    for point in reversed(series):
+        if not isinstance(point, dict):
+            continue
+        try:
+            val = point.get("american_odds")
+            if val is not None:
+                return int(val)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _find_book_series(books: dict, book_name: str | None) -> list | None:
+    if not books or not book_name:
+        return None
+    target = _normalize_book_key(book_name)
+    for key, series in books.items():
+        if _normalize_book_key(str(key)) == target:
+            return series if isinstance(series, list) else None
+    return None
 
 
 async def _calculate_clv_for_bet(bet_id: str) -> None:
     """
-    Fetch closing odds from the historics API and write book_clv + nvig_clv.
+    Fetch closing odds from the EV historics API and write book_clv + nvig_clv.
+    Uses the last recorded odds for the bet's book and for nvig fair value.
     Always fire-and-forget (never raises). Called after successful settlement.
     """
     try:
         bet = await run_in_threadpool(bet_tracking.get_bet, bet_id)
         if not bet:
             return
-        event_id = bet.get("event_id")
+
+        context = bet.get("historics_context")
         bet_odds = bet.get("odds")
-        if not bet_odds:
+        if not context or bet_odds is None:
             return
 
         try:
-            history_data = await sports_bridge.fetch_odds_history(
-                event_id=event_id,
-                date=bet.get("date"),
-                sport=bet.get("sport"),
-                team=bet.get("home_team") or bet.get("team"),
-                opponent=bet.get("away_team"),
-            )
+            bet_odds_int = int(bet_odds)
+        except (ValueError, TypeError):
+            return
+
+        try:
+            historics_data = await historics_bridge.fetch_historics(context)
         except Exception:
             return
 
-        closing: dict = history_data.get("closing") or {}
-        if not closing:
-            return
-        if (history_data.get("provider") or "").lower() == "generated":
-            return
+        books = historics_data.get("books") or {}
+        book_series = _find_book_series(books, bet.get("book"))
+        book_closing = _last_american_odds(book_series)
+        nvig_closing = _last_american_odds(historics_data.get("nvig"))
 
-        # Resolve which closing odds field corresponds to this pick
-        pick_raw = (bet.get("pick") or "").lower().strip()
-        pick_clean = re.sub(r"\s+[+-]?\d+\.?\d*$", "", pick_raw).strip()
-        market = (bet.get("market") or "").lower().strip()
-        moneyline_markets = {"moneyline", "match_winner", "three_way_moneyline"}
-        spread_markets = {"spread", "puck_line", "run_line"}
-        total_markets = {"total", "total_points", "total_goals", "total_runs"}
-        if market not in moneyline_markets | spread_markets | total_markets:
-            return
-        uses_spread_price = market in spread_markets
-
-        pick_closing: int | None = None
-        counterpart_closing: list[int] = []
-
-        def _matches_team(*names: str | None) -> bool:
-            pick_norm = re.sub(r"[^a-z0-9]", "", pick_clean)
-            for name in names:
-                name_norm = re.sub(r"[^a-z0-9]", "", (name or "").lower())
-                if pick_norm and name_norm and (
-                    pick_norm == name_norm
-                    or pick_norm in name_norm
-                    or name_norm in pick_norm
-                ):
-                    return True
-            return False
-
-        if pick_clean == "over":
-            if market not in total_markets:
-                return
-            pick_closing = closing.get("over_odds")
-            counterpart_closing = [closing.get("under_odds")]
-        elif pick_clean == "under":
-            if market not in total_markets:
-                return
-            pick_closing = closing.get("under_odds")
-            counterpart_closing = [closing.get("over_odds")]
-        elif pick_clean == "home":
-            pick_closing = closing.get(
-                "home_spread_odds" if uses_spread_price else "home_ml"
-            )
-            counterpart_closing = [
-                closing.get("away_spread_odds" if uses_spread_price else "away_ml")
-            ]
-            if not uses_spread_price:
-                counterpart_closing.append(closing.get("draw_odds"))
-        elif pick_clean == "away":
-            pick_closing = closing.get(
-                "away_spread_odds" if uses_spread_price else "away_ml"
-            )
-            counterpart_closing = [
-                closing.get("home_spread_odds" if uses_spread_price else "home_ml")
-            ]
-            if not uses_spread_price:
-                counterpart_closing.append(closing.get("draw_odds"))
-        elif pick_clean in {"draw", "tie"}:
-            if market not in moneyline_markets:
-                return
-            pick_closing = closing.get("draw_odds")
-            counterpart_closing = [closing.get("home_ml"), closing.get("away_ml")]
-        else:
-            if _matches_team(
-                bet.get("home_team"),
-                history_data.get("home_team"),
-                history_data.get("home_abbr"),
-            ):
-                pick_closing = closing.get(
-                    "home_spread_odds" if uses_spread_price else "home_ml"
-                )
-                counterpart_closing = [
-                    closing.get(
-                        "away_spread_odds" if uses_spread_price else "away_ml"
-                    )
-                ]
-                if not uses_spread_price:
-                    counterpart_closing.append(closing.get("draw_odds"))
-            elif _matches_team(
-                bet.get("away_team"),
-                history_data.get("away_team"),
-                history_data.get("away_abbr"),
-            ):
-                pick_closing = closing.get(
-                    "away_spread_odds" if uses_spread_price else "away_ml"
-                )
-                counterpart_closing = [
-                    closing.get(
-                        "home_spread_odds" if uses_spread_price else "home_ml"
-                    )
-                ]
-                if not uses_spread_price:
-                    counterpart_closing.append(closing.get("draw_odds"))
-
-        if pick_closing is None:
-            return
-
-        bet_line = bet.get("line")
-        if market in total_markets and bet_line is not None:
-            closing_line = closing.get("game_total")
-            if closing_line is None or abs(float(bet_line) - float(closing_line)) > 1e-9:
-                return
-        if uses_spread_price and bet_line is not None:
-            pick_is_home = _matches_team(
-                bet.get("home_team"),
-                history_data.get("home_team"),
-                history_data.get("home_abbr"),
-            )
-            closing_line = closing.get(
-                "home_spread" if pick_is_home else "away_spread"
-            )
-            if closing_line is None or abs(float(bet_line) - float(closing_line)) > 1e-9:
-                return
-
-        try:
-            pick_closing = int(pick_closing)
-        except (ValueError, TypeError):
-            return
-        clean_counterparts: list[int] = []
-        for odds in counterpart_closing:
-            if odds is None:
-                continue
-            try:
-                clean_counterparts.append(int(odds))
-            except (ValueError, TypeError):
-                continue
-
-        book_clv = _compute_book_clv(bet_odds, pick_closing)
-        nvig_clv = (
-            _compute_nvig_ev_multi(bet_odds, pick_closing, clean_counterparts)
-            if clean_counterparts
+        book_clv = (
+            _compute_book_clv(bet_odds_int, book_closing)
+            if book_closing is not None
             else None
         )
-        await run_in_threadpool(bet_tracking.update_bet_clv, bet_id, book_clv, nvig_clv)
+        nvig_clv = (
+            _compute_nvig_clv_from_fair(bet_odds_int, nvig_closing)
+            if nvig_closing is not None
+            else None
+        )
+
+        if book_clv is None and nvig_clv is None:
+            return
+
+        await run_in_threadpool(
+            bet_tracking.update_bet_clv, bet_id, book_clv, nvig_clv
+        )
     except Exception:
         pass  # CLV is non-critical — must never crash settlement flow
 
@@ -2130,6 +2043,7 @@ async def create_bet(
         book=body.book,
         counterpart_odds=body.counterpart_odds,
         nvig_at_placement=nvig_at_placement,
+        historics_context=body.historics_context,
     )
     settlement = await _build_settlement(bet)
     refreshed = await run_in_threadpool(bet_tracking.get_bet, bet["bet_id"])
@@ -2538,6 +2452,7 @@ async def get_bet(
         settlement = _stored_settlement(bet)
         if (
             bet.get("book_clv") is None
+            and bet.get("historics_context")
             and bet["status"] in {"win", "loss", "push", "void"}
         ):
             asyncio.ensure_future(_calculate_clv_for_bet(bet_id))
