@@ -6,7 +6,8 @@ Phase 1 — Reconstruct historics JWT from existing row fields (same payload as
           bettor-odds data-historics) for rows missing historics_context.
 
 Phase 2 — For settled bets (win/loss/push/void) with historics_context + odds,
-          fetch historics API and write book_clv / nvig_clv.
+          fetch historics API and write book_clv, nvig_clv, book_closing_odds,
+          nvig_closing_odds.
 
 Dry-run by default. Use --apply to write.
 
@@ -242,6 +243,8 @@ class ClvResult:
     ok: bool
     book_clv: float | None = None
     nvig_clv: float | None = None
+    book_closing_odds: int | None = None
+    nvig_closing_odds: int | None = None
     error: str | None = None
 
 
@@ -281,7 +284,14 @@ async def compute_clv_for_row(row: sqlite3.Row) -> ClvResult:
     )
     if book_clv is None and nvig_clv is None:
         return ClvResult(bet_id, False, error="no closing lines in historics")
-    return ClvResult(bet_id, True, book_clv=book_clv, nvig_clv=nvig_clv)
+    return ClvResult(
+        bet_id,
+        True,
+        book_clv=book_clv,
+        nvig_clv=nvig_clv,
+        book_closing_odds=book_closing,
+        nvig_closing_odds=nvig_closing,
+    )
 
 
 @dataclass
@@ -314,14 +324,20 @@ async def run_clv_batch(
                 stats.clv_ok += 1
                 if apply:
                     bet_tracking.update_bet_clv(
-                        result.bet_id, result.book_clv, result.nvig_clv
+                        result.bet_id,
+                        result.book_clv,
+                        result.nvig_clv,
+                        book_closing_odds=result.book_closing_odds,
+                        nvig_closing_odds=result.nvig_closing_odds,
                     )
                     stats.clv_updated += 1
                 log.info(
-                    "CLV %s book=%s nvig=%s",
+                    "CLV %s book=%s nvig=%s close_book=%s close_nvig=%s",
                     result.bet_id[:8],
                     result.book_clv,
                     result.nvig_clv,
+                    result.book_closing_odds,
+                    result.nvig_closing_odds,
                 )
             else:
                 stats.clv_failed += 1

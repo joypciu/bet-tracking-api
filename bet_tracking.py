@@ -313,7 +313,9 @@ def init_db() -> None:
                 book_clv           REAL,
                 nvig_clv           REAL,
                 clv_calculated_at  TEXT,
-                historics_context  TEXT
+                historics_context  TEXT,
+                book_closing_odds  INTEGER,
+                nvig_closing_odds  INTEGER
             )
             """)
         ub_cols = {
@@ -322,6 +324,9 @@ def init_db() -> None:
         }
         if "historics_context" not in ub_cols:
             con.execute("ALTER TABLE user_bets ADD COLUMN historics_context TEXT")
+        for col in ("book_closing_odds", "nvig_closing_odds"):
+            if col not in ub_cols:
+                con.execute(f"ALTER TABLE user_bets ADD COLUMN {col} INTEGER")
 
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_user_bets_user_id ON user_bets(user_id)"
@@ -1019,16 +1024,27 @@ def update_bet_clv(
     bet_id: str,
     book_clv: float | None,
     nvig_clv: float | None,
+    *,
+    book_closing_odds: int | None = None,
+    nvig_closing_odds: int | None = None,
 ) -> None:
     clv_calculated_at = datetime.now(timezone.utc).isoformat()
     with _conn() as con:
         con.execute(
             """
             UPDATE user_bets
-            SET book_clv = ?, nvig_clv = ?, clv_calculated_at = ?
+            SET book_clv = ?, nvig_clv = ?, clv_calculated_at = ?,
+                book_closing_odds = ?, nvig_closing_odds = ?
             WHERE bet_id = ?
             """,
-            (book_clv, nvig_clv, clv_calculated_at, bet_id),
+            (
+                book_clv,
+                nvig_clv,
+                clv_calculated_at,
+                book_closing_odds,
+                nvig_closing_odds,
+                bet_id,
+            ),
         )
 
 

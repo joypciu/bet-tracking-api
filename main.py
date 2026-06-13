@@ -1891,6 +1891,8 @@ def _bet_response(bet: dict, settlement: dict | None = None) -> dict:
         "nvig_at_placement": bet.get("nvig_at_placement"),
         "book_clv": bet.get("book_clv"),
         "nvig_clv": bet.get("nvig_clv"),
+        "book_closing_odds": bet.get("book_closing_odds"),
+        "nvig_closing_odds": bet.get("nvig_closing_odds"),
         "clv_calculated_at": bet.get("clv_calculated_at"),
         "settlement": settlement,
     }
@@ -1919,8 +1921,9 @@ def _selection_line_for_storage(body: CreateBetRequest) -> str | None:
 
 async def _calculate_clv_for_bet(bet_id: str) -> None:
     """
-    Fetch closing odds from the EV historics API and write book_clv + nvig_clv.
-    Uses the last recorded odds for the bet's book and for nvig fair value.
+    Fetch closing odds from the EV historics API and write book_clv, nvig_clv,
+    book_closing_odds, and nvig_closing_odds. Uses the last recorded odds for
+    the bet's book and for nvig fair value.
     Always fire-and-forget (never raises). Called after successful settlement.
     """
     try:
@@ -1963,7 +1966,12 @@ async def _calculate_clv_for_bet(bet_id: str) -> None:
             return
 
         await run_in_threadpool(
-            bet_tracking.update_bet_clv, bet_id, book_clv, nvig_clv
+            bet_tracking.update_bet_clv,
+            bet_id,
+            book_clv,
+            nvig_clv,
+            book_closing_odds=book_closing,
+            nvig_closing_odds=nvig_closing,
         )
     except Exception:
         pass  # CLV is non-critical — must never crash settlement flow
