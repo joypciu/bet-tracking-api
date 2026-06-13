@@ -2198,8 +2198,26 @@ async def bets_summary(
 @app.get("/bets/analytics", tags=["bets"])
 async def bets_analytics(
     email: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(
+        None, description="Event date lower bound (YYYY-MM-DD, inclusive)"
+    ),
+    date_to: Optional[str] = Query(
+        None, description="Event date upper bound (YYYY-MM-DD, inclusive)"
+    ),
+    period: Optional[str] = Query(
+        None, description="Echo-only label: all, daily, weekly, monthly, custom"
+    ),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
+    if date_from and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_from):
+        raise HTTPException(status_code=400, detail="date_from must be YYYY-MM-DD")
+    if date_to and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_to):
+        raise HTTPException(status_code=400, detail="date_to must be YYYY-MM-DD")
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=400, detail="date_from must be on or before date_to"
+        )
+
     # Cookie / API key auth → always scope to token email
     # Bearer auth → use ?email= query param if provided
     if auth_user and auth_user.get("auth_type") in ("cookie", "api_key"):
@@ -2213,16 +2231,22 @@ async def bets_analytics(
         )
         if db_user:
             analytics = await run_in_threadpool(
-                bet_tracking.get_user_analytics, db_user["user_id"]
+                bet_tracking.get_user_analytics,
+                db_user["user_id"],
+                date_from,
+                date_to,
             )
             return JSONResponse(
                 {
                     "user": {"user_id": db_user["user_id"], "email": db_user["email"]},
+                    "period_label": period,
                     **analytics,
                 }
             )
-    analytics = await run_in_threadpool(bet_tracking.get_analytics)
-    return JSONResponse(analytics)
+    analytics = await run_in_threadpool(
+        bet_tracking.get_analytics, date_from, date_to
+    )
+    return JSONResponse({**analytics, "period_label": period})
 
 
 # @app.get("/bets/prop-markets", tags=["bets"])
@@ -2803,19 +2827,35 @@ async def user_stats(
 @app.get("/users/{email}/analytics", tags=["users"])
 async def user_analytics(
     email: str,
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    period: Optional[str] = Query(None),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
+    if date_from and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_from):
+        raise HTTPException(status_code=400, detail="date_from must be YYYY-MM-DD")
+    if date_to and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_to):
+        raise HTTPException(status_code=400, detail="date_to must be YYYY-MM-DD")
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=400, detail="date_from must be on or before date_to"
+        )
+
     db_user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
     if not db_user:
         raise HTTPException(
             status_code=404, detail=f"No user found for email '{email}'"
         )
     analytics = await run_in_threadpool(
-        bet_tracking.get_user_analytics, db_user["user_id"]
+        bet_tracking.get_user_analytics,
+        db_user["user_id"],
+        date_from,
+        date_to,
     )
     return JSONResponse(
         {
             "user": {"user_id": db_user["user_id"], "email": db_user["email"]},
+            "period_label": period,
             **analytics,
         }
     )

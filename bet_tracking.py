@@ -1126,10 +1126,29 @@ def get_summary(user_id: str | None = None) -> dict[str, Any]:
     }
 
 
+def _clv_valid_for_analytics(book_clv: object, odds: object) -> bool:
+    """Skip corrupt odds/CLV rows so averages are not skewed by bad data."""
+    if book_clv is None:
+        return False
+    try:
+        clv = float(book_clv)
+        if abs(clv) > 2.0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    if odds is None:
+        return False
+    try:
+        american = int(odds)
+    except (TypeError, ValueError):
+        return False
+    return 100 <= abs(american) <= 50000
+
+
 def _analytics_from_rows(rows: list) -> dict[str, Any]:
     settled_wins = settled_losses = settled_pushes = 0
     total_staked = total_returned = 0.0
-    odds_list: list[float] = []
+    book_clv_list: list[float] = []
 
     by_market: dict[str, dict] = {}
     by_sport: dict[str, dict] = {}
@@ -1179,8 +1198,6 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
             bb["wins"] += 1
             bb["staked"] += stake
             bb["returned"] += payout
-            if odds is not None:
-                odds_list.append(float(odds))
         elif status == "loss":
             settled_losses += 1
             total_staked += stake
@@ -1190,8 +1207,6 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
             sb["staked"] += stake
             bb["losses"] += 1
             bb["staked"] += stake
-            if odds is not None:
-                odds_list.append(float(odds))
         elif status == "push":
             settled_pushes += 1
             total_staked += stake
@@ -1205,12 +1220,15 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
             bb["pushes"] += 1
             bb["staked"] += stake
             bb["returned"] += stake
-            if odds is not None:
-                odds_list.append(float(odds))
         elif status == "pending":
             mb["pending"] += 1
             sb["pending"] += 1
             bb["pending"] += 1
+
+        if status in ("win", "loss", "push") and _clv_valid_for_analytics(
+            r["book_clv"], r["odds"]
+        ):
+            book_clv_list.append(float(r["book_clv"]))
 
     settled = settled_wins + settled_losses + settled_pushes
     win_rate = round(settled_wins / settled * 100, 1) if settled else None
@@ -1219,7 +1237,9 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
         if total_staked
         else None
     )
-    avg_odds = round(sum(odds_list) / len(odds_list), 1) if odds_list else None
+    avg_clv = (
+        round(sum(book_clv_list) / len(book_clv_list), 4) if book_clv_list else None
+    )
 
     def _clean(d: dict) -> dict:
         for v in d.values():
@@ -1235,7 +1255,7 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
         "pending_bets": sum(v.get("pending", 0) for v in by_market.values()),
         "win_rate_pct": win_rate,
         "roi_pct": roi,
-        "avg_odds": avg_odds,
+        "avg_clv": avg_clv,
         "total_staked": round(total_staked, 2),
         "total_returned": round(total_returned, 2),
         "net_profit": round(total_returned - total_staked, 2),
@@ -1250,22 +1270,61 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
     }
 
 
-def get_analytics() -> dict[str, Any]:
+def _analytics_date_clause(
+    date_from: str | None,
+    date_to: str | None,
+    *,
+    user_id: str | None = None,
+) -> tuple[str, list[Any]]:
+    sql = (
+        "SELECT status, market, sport, book, odds, stake, book_clv, date "
+        "FROM user_bets WHERE 1=1"
+    )
+    params: list[Any] = []
+    if user_id:
+        sql += " AND user_id = ?"
+        params.append(user_id)
+    if date_from or date_to:
+        sql += " AND date IS NOT NULL AND date != ''"
+    if date_from:
+        sql += " AND date >= ?"
+        params.append(date_from)
+    if date_to:
+        sql += " AND date <= ?"
+        params.append(date_to)
+    return sql, params
+
+
+def get_analytics(
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    sql, params = _analytics_date_clause(date_from, date_to)
     with _conn() as con:
-        rows = con.execute(
-            "SELECT status, market, sport, book, odds, stake FROM user_bets"
-        ).fetchall()
-    return _analytics_from_rows(rows)
+        rows = con.execute(sql, params).fetchall()
+    result = _analytics_from_rows(rows)
+    result["period"] = {
+        "from": date_from,
+        "to": date_to,
+    }
+    return result
 
 
 def get_user_summary(user_id: str) -> dict[str, Any]:
     return get_summary(user_id)
 
 
-def get_user_analytics(user_id: str) -> dict[str, Any]:
+def get_user_analytics(
+    user_id: str,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    sql, params = _analytics_date_clause(date_from, date_to, user_id=user_id)
     with _conn() as con:
-        rows = con.execute(
-            "SELECT status, market, sport, book, odds, stake FROM user_bets WHERE user_id = ?",
-            (user_id,),
-        ).fetchall()
-    return _analytics_from_rows(rows)
+        rows = con.execute(sql, params).fetchall()
+    result = _analytics_from_rows(rows)
+    result["period"] = {
+        "from": date_from,
+        "to": date_to,
+    }
+    return result
