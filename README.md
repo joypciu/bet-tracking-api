@@ -154,6 +154,8 @@ curl -X POST http://localhost:5002/bets \
 | `stake`     | float        | Wager amount                                                         |
 | `notes`     | string       | Free-form notes                                                      |
 | `book`      | string       | Sportsbook name (e.g. `"FanDuel"`)                                  |
+| `counterpart_odds` | int    | Other side's placement odds; enables `nvig_at_placement`             |
+| `historics_context` | string | Signed KeepBetting historics context; enables same-book closing CLV |
 | `email`     | string       | Associates bet with a user profile (created automatically)           |
 
 ### Market aliases
@@ -251,9 +253,21 @@ Every bet response includes:
   "odds": -115,
   "stake": 50.0,
   "book": "FanDuel",
+  "book_clv": 0.0421,
+  "nvig_clv": 0.0618,
+  "clv_source": "keepbetting_historics",
+  "clv_book": "FanDuel",
+  "book_closing_odds": -125,
+  "nvig_closing_odds": -120,
+  "clv_closing_at": "2026-05-10T18:59:30+00:00",
   "settlement": { "outcome": "...", "settled": false, ... }
 }
 ```
+
+When `historics_context` is present, settlement uses the last pre-start price
+for the tracked `book` and the endpoint's no-vig history. Without a context,
+CLV remains unavailable. Missing tracked-book history leaves `book_clv` as
+`null` while `nvig_clv` can still be calculated when no-vig history exists.
 
 ## Live testing
 

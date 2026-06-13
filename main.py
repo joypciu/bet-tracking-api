@@ -20,13 +20,21 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 import httpx
+import jwt
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Body, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 load_dotenv()
 
@@ -125,6 +133,78 @@ def _compute_book_clv(bet_odds: int, closing_pick_odds: int) -> float | None:
         return None
 
 
+def _normalize_book_name(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def _parse_history_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _closing_history_odds(
+    series: Any,
+    event_datetime: str | None,
+) -> tuple[int | None, str | None]:
+    if not isinstance(series, list):
+        return None, None
+    cutoff = _parse_history_datetime(event_datetime)
+    candidates: list[tuple[datetime, int, str]] = []
+    for entry in series:
+        if not isinstance(entry, dict):
+            continue
+        timestamp_raw = entry.get("datetime")
+        timestamp = _parse_history_datetime(timestamp_raw)
+        if timestamp is None or (cutoff is not None and timestamp > cutoff):
+            continue
+        try:
+            odds = int(entry.get("american_odds"))
+        except (TypeError, ValueError):
+            continue
+        if odds == 0:
+            continue
+        candidates.append((timestamp, odds, str(timestamp_raw)))
+    if not candidates:
+        return None, None
+    _, odds, timestamp_raw = max(candidates, key=lambda item: item[0])
+    return odds, timestamp_raw
+
+
+def _find_book_history(
+    books: Any,
+    requested_book: str | None,
+) -> tuple[str | None, list[dict[str, Any]]]:
+    if not isinstance(books, dict) or not requested_book:
+        return None, []
+    target = _normalize_book_name(requested_book)
+    for name, series in books.items():
+        if _normalize_book_name(str(name)) == target and isinstance(series, list):
+            return str(name), series
+    return None, []
+
+
+def _historics_event_datetime(context: str | None) -> str | None:
+    if not context:
+        return None
+    try:
+        payload = jwt.decode(
+            context,
+            options={"verify_signature": False},
+            algorithms=["HS256"],
+        )
+    except jwt.PyJWTError:
+        return None
+    value = payload.get("date") if isinstance(payload, dict) else None
+    return str(value) if value else None
+
+
 # ---------------------------------------------------------------------------
 # Request model (mirrors cache-api CreateBetRequest exactly)
 # ---------------------------------------------------------------------------
@@ -155,7 +235,13 @@ class CreateBetRequest(BaseModel):
     )
     historics_context: Optional[str] = Field(
         None,
-        description="JWT from EV feed data-historics — used to compute CLV after settlement",
+        validation_alias=AliasChoices(
+            "historics_context",
+            "clv_context",
+            "context",
+        ),
+        description="Signed KeepBetting historics context for same-book CLV",
+        max_length=8192,
     )
 
     _raw_line: Optional[str] = PrivateAttr(default=None)
@@ -187,6 +273,14 @@ class CreateBetRequest(BaseModel):
         if norm.startswith("player_"):
             return norm
         return norm
+
+    @field_validator("historics_context")
+    @classmethod
+    def validate_historics_context(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
 
     @field_validator("date")
     @classmethod
@@ -1863,6 +1957,11 @@ def _bet_response(bet: dict, settlement: dict | None = None) -> dict:
         "book_clv": bet.get("book_clv"),
         "nvig_clv": bet.get("nvig_clv"),
         "clv_calculated_at": bet.get("clv_calculated_at"),
+        "clv_source": bet.get("clv_source"),
+        "clv_book": bet.get("clv_book"),
+        "book_closing_odds": bet.get("book_closing_odds"),
+        "nvig_closing_odds": bet.get("nvig_closing_odds"),
+        "clv_closing_at": bet.get("clv_closing_at"),
         "settlement": settlement,
     }
 
@@ -1884,43 +1983,13 @@ def _selection_line_for_storage(body: CreateBetRequest) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# CLV background calculator (EV feed historics)
+# CLV background calculator
 # ---------------------------------------------------------------------------
-
-
-def _normalize_book_key(name: str | None) -> str:
-    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
-
-
-def _last_american_odds(series: list | None) -> int | None:
-    if not series:
-        return None
-    for point in reversed(series):
-        if not isinstance(point, dict):
-            continue
-        try:
-            val = point.get("american_odds")
-            if val is not None:
-                return int(val)
-        except (ValueError, TypeError):
-            continue
-    return None
-
-
-def _find_book_series(books: dict, book_name: str | None) -> list | None:
-    if not books or not book_name:
-        return None
-    target = _normalize_book_key(book_name)
-    for key, series in books.items():
-        if _normalize_book_key(str(key)) == target:
-            return series if isinstance(series, list) else None
-    return None
 
 
 async def _calculate_clv_for_bet(bet_id: str) -> None:
     """
-    Fetch closing odds from the EV historics API and write book_clv + nvig_clv.
-    Uses the last recorded odds for the bet's book and for nvig fair value.
+    Fetch KeepBetting history and write same-book and no-vig closing CLV.
     Always fire-and-forget (never raises). Called after successful settlement.
     """
     try:
@@ -1943,10 +2012,19 @@ async def _calculate_clv_for_bet(bet_id: str) -> None:
         except Exception:
             return
 
-        books = historics_data.get("books") or {}
-        book_series = _find_book_series(books, bet.get("book"))
-        book_closing = _last_american_odds(book_series)
-        nvig_closing = _last_american_odds(historics_data.get("nvig"))
+        clv_book, book_series = _find_book_history(
+            historics_data.get("books"),
+            bet.get("book"),
+        )
+        event_datetime = bet.get("event_datetime") or _historics_event_datetime(context)
+        book_closing, book_closing_at = _closing_history_odds(
+            book_series,
+            event_datetime,
+        )
+        nvig_closing, nvig_closing_at = _closing_history_odds(
+            historics_data.get("nvig"),
+            event_datetime,
+        )
 
         book_clv = (
             _compute_book_clv(bet_odds_int, book_closing)
@@ -1959,11 +2037,16 @@ async def _calculate_clv_for_bet(bet_id: str) -> None:
             else None
         )
 
-        if book_clv is None and nvig_clv is None:
-            return
-
         await run_in_threadpool(
-            bet_tracking.update_bet_clv, bet_id, book_clv, nvig_clv
+            bet_tracking.update_bet_clv,
+            bet_id,
+            book_clv,
+            nvig_clv,
+            "keepbetting_historics",
+            clv_book,
+            book_closing,
+            nvig_closing,
+            book_closing_at or nvig_closing_at,
         )
     except Exception:
         pass  # CLV is non-critical — must never crash settlement flow
@@ -2451,7 +2534,7 @@ async def get_bet(
     else:
         settlement = _stored_settlement(bet)
         if (
-            bet.get("book_clv") is None
+            bet.get("clv_calculated_at") is None
             and bet.get("historics_context")
             and bet["status"] in {"win", "loss", "push", "void"}
         ):

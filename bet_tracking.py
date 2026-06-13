@@ -313,9 +313,42 @@ def init_db() -> None:
                 book_clv           REAL,
                 nvig_clv           REAL,
                 clv_calculated_at  TEXT,
-                historics_context  TEXT
+                historics_context  TEXT,
+                clv_source         TEXT,
+                clv_book           TEXT,
+                book_closing_odds  INTEGER,
+                nvig_closing_odds  INTEGER,
+                clv_closing_at     TEXT
             )
             """)
+        user_bet_cols = {
+            row["name"]
+            for row in con.execute("PRAGMA table_info(user_bets)").fetchall()
+        }
+        for col, typ in [
+            ("historics_context", "TEXT"),
+            ("clv_source", "TEXT"),
+            ("clv_book", "TEXT"),
+            ("book_closing_odds", "INTEGER"),
+            ("nvig_closing_odds", "INTEGER"),
+            ("clv_closing_at", "TEXT"),
+        ]:
+            if col not in user_bet_cols:
+                con.execute(f"ALTER TABLE user_bets ADD COLUMN {col} {typ}")
+
+        # Values created before clv_source existed may have compared the ticket
+        # against a different ESPN provider. Do not keep presenting them as
+        # same-book CLV.
+        con.execute(
+            """
+            UPDATE user_bets
+            SET book_clv = NULL,
+                nvig_clv = NULL,
+                clv_calculated_at = NULL
+            WHERE clv_source IS NULL
+              AND (book_clv IS NOT NULL OR nvig_clv IS NOT NULL)
+            """
+        )
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_user_bets_user_id ON user_bets(user_id)"
         )
@@ -326,13 +359,6 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_user_bets_status ON user_bets(status)"
         )
         con.execute("CREATE INDEX IF NOT EXISTS idx_user_bets_date ON user_bets(date)")
-
-        ub_cols = {
-            row["name"]
-            for row in con.execute("PRAGMA table_info(user_bets)").fetchall()
-        }
-        if "historics_context" not in ub_cols:
-            con.execute("ALTER TABLE user_bets ADD COLUMN historics_context TEXT")
 
         # Drop synchronization triggers if they exist.
         con.execute("DROP TRIGGER IF EXISTS trg_bets_ai_sync_user_bets")
@@ -779,7 +805,8 @@ def create_bet(
                 (bet_id, created_at, user_id, sport, league, date, event, event_datetime,
                  event_id, team, home_team, away_team, player, market, pick,
                  selection_line, line, odds, stake, notes, book,
-                 counterpart_odds, nvig_at_placement, historics_context, shared_bet_id)
+                 counterpart_odds, nvig_at_placement, historics_context,
+                 shared_bet_id)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
@@ -1018,16 +1045,38 @@ def update_bet_clv(
     bet_id: str,
     book_clv: float | None,
     nvig_clv: float | None,
+    clv_source: str,
+    clv_book: str | None = None,
+    book_closing_odds: int | None = None,
+    nvig_closing_odds: int | None = None,
+    clv_closing_at: str | None = None,
 ) -> None:
     clv_calculated_at = datetime.now(timezone.utc).isoformat()
     with _conn() as con:
         con.execute(
             """
             UPDATE user_bets
-            SET book_clv = ?, nvig_clv = ?, clv_calculated_at = ?
+            SET book_clv = ?,
+                nvig_clv = ?,
+                clv_calculated_at = ?,
+                clv_source = ?,
+                clv_book = ?,
+                book_closing_odds = ?,
+                nvig_closing_odds = ?,
+                clv_closing_at = ?
             WHERE bet_id = ?
             """,
-            (book_clv, nvig_clv, clv_calculated_at, bet_id),
+            (
+                book_clv,
+                nvig_clv,
+                clv_calculated_at,
+                clv_source,
+                clv_book,
+                book_closing_odds,
+                nvig_closing_odds,
+                clv_closing_at,
+                bet_id,
+            ),
         )
 
 
