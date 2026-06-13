@@ -63,7 +63,7 @@ _DB_TO_DISPLAY: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# CLV math (mirrors main.py — kept local to avoid loading FastAPI)
+# CLV math (mirrors main.py)
 # ---------------------------------------------------------------------------
 
 

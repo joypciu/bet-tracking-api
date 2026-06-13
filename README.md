@@ -255,19 +255,12 @@ Every bet response includes:
   "book": "FanDuel",
   "book_clv": 0.0421,
   "nvig_clv": 0.0618,
-  "clv_source": "keepbetting_historics",
-  "clv_book": "FanDuel",
-  "book_closing_odds": -125,
-  "nvig_closing_odds": -120,
-  "clv_closing_at": "2026-05-10T18:59:30+00:00",
   "settlement": { "outcome": "...", "settled": false, ... }
 }
 ```
 
-When `historics_context` is present, settlement uses the last pre-start price
-for the tracked `book` and the endpoint's no-vig history. Without a context,
-CLV remains unavailable. Missing tracked-book history leaves `book_clv` as
-`null` while `nvig_clv` can still be calculated when no-vig history exists.
+When `historics_context` is present, CLV is computed from the last historics
+point for the bet's book and the nvig fair line. Without context, CLV stays blank.
 
 ## Live testing
 
