@@ -315,7 +315,8 @@ def init_db() -> None:
                 clv_calculated_at  TEXT,
                 historics_context  TEXT,
                 book_closing_odds  INTEGER,
-                nvig_closing_odds  INTEGER
+                nvig_closing_odds  INTEGER,
+                nvig_odds_at_placement INTEGER
             )
             """)
         ub_cols = {
@@ -327,6 +328,10 @@ def init_db() -> None:
         for col in ("book_closing_odds", "nvig_closing_odds"):
             if col not in ub_cols:
                 con.execute(f"ALTER TABLE user_bets ADD COLUMN {col} INTEGER")
+        if "nvig_odds_at_placement" not in ub_cols:
+            con.execute(
+                "ALTER TABLE user_bets ADD COLUMN nvig_odds_at_placement INTEGER"
+            )
 
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_user_bets_user_id ON user_bets(user_id)"
@@ -755,6 +760,7 @@ def create_bet(
     book: str | None = None,
     counterpart_odds: int | None = None,
     nvig_at_placement: float | None = None,
+    nvig_odds_at_placement: int | None = None,
     historics_context: str | None = None,
 ) -> dict[str, Any]:
     bet_id = str(uuid.uuid4())
@@ -785,8 +791,8 @@ def create_bet(
                  event_id, team, home_team, away_team, player, market, pick,
                  selection_line, line, odds, stake, notes, book,
                  counterpart_odds, nvig_at_placement, historics_context,
-                 shared_bet_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 nvig_odds_at_placement, shared_bet_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 bet_id,
@@ -813,6 +819,7 @@ def create_bet(
                 counterpart_odds,
                 nvig_at_placement,
                 historics_context,
+                nvig_odds_at_placement,
                 shared_bet_id,
             ),
         )
@@ -1045,6 +1052,22 @@ def update_bet_clv(
                 nvig_closing_odds,
                 bet_id,
             ),
+        )
+
+
+def update_bet_nvig_odds_at_placement(
+    bet_id: str,
+    nvig_odds_at_placement: int | None,
+    nvig_at_placement: float | None = None,
+) -> None:
+    with _conn() as con:
+        con.execute(
+            """
+            UPDATE user_bets
+            SET nvig_odds_at_placement = ?, nvig_at_placement = ?
+            WHERE bet_id = ?
+            """,
+            (nvig_odds_at_placement, nvig_at_placement, bet_id),
         )
 
 

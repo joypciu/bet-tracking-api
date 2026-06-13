@@ -125,6 +125,20 @@ def _compute_book_clv(bet_odds: int, closing_pick_odds: int) -> float | None:
         return None
 
 
+def _resolve_nvig_at_placement(
+    bet_odds: int | None,
+    nvig_odds_at_placement: int | None,
+    counterpart_odds: int | None,
+) -> float | None:
+    if bet_odds is None:
+        return None
+    if nvig_odds_at_placement is not None:
+        return _compute_nvig_clv_from_fair(bet_odds, nvig_odds_at_placement)
+    if counterpart_odds is not None:
+        return _compute_nvig_ev(bet_odds, bet_odds, counterpart_odds)
+    return None
+
+
 def _normalize_book_key(name: str | None) -> str:
     return re.sub(r"[^a-z0-9]", "", (name or "").lower())
 
@@ -182,12 +196,29 @@ class CreateBetRequest(BaseModel):
         None,
         description="Other side's American odds at placement — enables nvig_at_placement EV calculation",
     )
+    nvig_odds_at_placement: Optional[int] = Field(
+        None,
+        description="Fair no-vig American odds for this prop at track time (EV feed Weighted Market Average)",
+    )
     historics_context: Optional[str] = Field(
         None,
         description="JWT from EV feed data-historics — used to compute CLV after settlement",
     )
 
     _raw_line: Optional[str] = PrivateAttr(default=None)
+
+    @field_validator("nvig_odds_at_placement", mode="before")
+    @classmethod
+    def sanitize_nvig_odds_at_placement(cls, v: object) -> int | None:
+        if v is None or v == "":
+            return None
+        try:
+            n = int(v)
+        except (ValueError, TypeError):
+            return None
+        if n == 0 or abs(n) < 100 or abs(n) > 50000:
+            return None
+        return n
 
     @field_validator("market")
     @classmethod
@@ -1889,6 +1920,7 @@ def _bet_response(bet: dict, settlement: dict | None = None) -> dict:
         "settled_at": bet.get("settled_at"),
         "settlement_source": bet.get("settlement_source"),
         "nvig_at_placement": bet.get("nvig_at_placement"),
+        "nvig_odds_at_placement": bet.get("nvig_odds_at_placement"),
         "book_clv": bet.get("book_clv"),
         "nvig_clv": bet.get("nvig_clv"),
         "book_closing_odds": bet.get("book_closing_odds"),
@@ -2022,11 +2054,9 @@ async def create_bet(
         )
         user_id = db_user["user_id"]
 
-    nvig_at_placement: Optional[float] = None
-    if body.counterpart_odds is not None and body.odds is not None:
-        nvig_at_placement = _compute_nvig_ev(
-            body.odds, body.odds, body.counterpart_odds
-        )
+    nvig_at_placement = _resolve_nvig_at_placement(
+        body.odds, body.nvig_odds_at_placement, body.counterpart_odds
+    )
 
     bet = await run_in_threadpool(
         bet_tracking.create_bet,
@@ -2051,6 +2081,7 @@ async def create_bet(
         book=body.book,
         counterpart_odds=body.counterpart_odds,
         nvig_at_placement=nvig_at_placement,
+        nvig_odds_at_placement=body.nvig_odds_at_placement,
         historics_context=body.historics_context,
     )
     settlement = await _build_settlement(bet)
