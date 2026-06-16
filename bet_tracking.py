@@ -586,6 +586,45 @@ def get_user_by_id(user_id: str) -> dict[str, Any] | None:
     return _row_to_dict(row)
 
 
+def get_tracked_historics_contexts(user_id: str) -> list[str]:
+    """Return distinct historics_context JWTs for this user's pending bets.
+
+    The EV feed matches rows via data-historics (same JWT saved at track time).
+    """
+    with _conn() as con:
+        rows = con.execute(
+            """
+            SELECT DISTINCT historics_context
+            FROM user_bets
+            WHERE user_id = ?
+              AND status = 'pending'
+              AND historics_context IS NOT NULL
+              AND TRIM(historics_context) != ''
+            """,
+            (user_id,),
+        ).fetchall()
+    return [r["historics_context"] for r in rows]
+
+
+def get_tracked_fingerprints(user_id: str) -> list[str]:
+    """Return fingerprints for this user's pending bets only.
+
+    Settled bets (win/loss/push/void) are excluded — the EV feed only surfaces
+    future markets, so those rows would never reappear anyway.
+    """
+    with _conn() as con:
+        rows = con.execute(
+            """
+            SELECT DISTINCT sb.fingerprint
+            FROM user_bets ub
+            JOIN shared_bets sb ON ub.shared_bet_id = sb.shared_bet_id
+            WHERE ub.user_id = ? AND ub.status = 'pending'
+            """,
+            (user_id,),
+        ).fetchall()
+    return [r["fingerprint"] for r in rows]
+
+
 def list_users(limit: int = 50, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
     with _conn() as con:
         total = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]

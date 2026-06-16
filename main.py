@@ -2761,6 +2761,32 @@ async def list_users(
     )
 
 
+@app.get("/users/me/tracked-bets", tags=["users"])
+async def get_my_tracked_bets(
+    auth_user: dict = Depends(require_auth),
+) -> JSONResponse:
+    """Return historics_context JWTs for the user's pending tracked bets.
+
+    The EV feed hides rows whose data-historics matches any returned token
+    (compared by decoded event/market/prop/date/league, ignoring sportsbook).
+    """
+    if auth_user.get("auth_type") not in ("cookie", "api_key"):
+        return JSONResponse([])
+
+    email = auth_user.get("email")
+    if not email:
+        return JSONResponse([])
+
+    db_user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
+    if not db_user:
+        return JSONResponse([])
+
+    tracked_bets = await run_in_threadpool(
+        bet_tracking.get_tracked_historics_contexts, db_user["user_id"]
+    )
+    return JSONResponse(tracked_bets)
+
+
 @app.get("/users/{email}/bets", tags=["users"])
 async def user_bets(
     email: str,
