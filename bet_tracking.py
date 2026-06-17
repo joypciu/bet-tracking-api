@@ -465,6 +465,8 @@ def init_db() -> None:
                 ),
             )
 
+    sync_api_user_mirrors()
+
 
 def _create_or_get_shared_bet(
     con: sqlite3.Connection,
@@ -567,6 +569,50 @@ def create_or_get_user(email: str) -> dict[str, Any]:
             (user_id, normalised, created_at),
         )
     return {"user_id": user_id, "email": normalised, "created_at": created_at}
+
+
+def ensure_api_user_mirrored(user_id: str, email: str) -> dict[str, Any]:
+    """
+    Ensure an api_users identity also exists in users so user_bets FK is satisfied.
+    Uses api_users.user_id as the canonical id. Idempotent — safe to call on every bet.
+    """
+    normalised = validate_email(email)
+    with _conn() as con:
+        row = con.execute(
+            "SELECT * FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if row:
+            return _row_to_dict(row)  # type: ignore[return-value]
+
+        email_row = con.execute(
+            "SELECT user_id FROM users WHERE email = ?", (normalised,)
+        ).fetchone()
+        if email_row and email_row["user_id"] != user_id:
+            old_id = email_row["user_id"]
+            has_bets = con.execute(
+                "SELECT 1 FROM user_bets WHERE user_id = ? LIMIT 1", (old_id,)
+            ).fetchone()
+            if has_bets:
+                raise ValueError(
+                    f"Email {normalised!r} is already linked to a different users "
+                    f"record with existing bets; contact support to migrate."
+                )
+            con.execute("DELETE FROM users WHERE user_id = ?", (old_id,))
+
+        created_at = datetime.now(timezone.utc).isoformat()
+        con.execute(
+            "INSERT INTO users (user_id, email, created_at) VALUES (?,?,?)",
+            (user_id, normalised, created_at),
+        )
+    return {"user_id": user_id, "email": normalised, "created_at": created_at}
+
+
+def sync_api_user_mirrors() -> None:
+    """Ensure every api_users row has a matching users row (startup backfill)."""
+    with _conn() as con:
+        rows = con.execute("SELECT user_id, email FROM api_users").fetchall()
+    for row in rows:
+        ensure_api_user_mirrored(row["user_id"], row["email"])
 
 
 def get_user_by_email(email: str) -> dict[str, Any] | None:
@@ -689,6 +735,7 @@ def create_api_user(
                 created_at,
             ),
         )
+    ensure_api_user_mirrored(user_id, normalised)
     return {
         "user_id": user_id,
         "name": name.strip(),
@@ -1362,6 +1409,19 @@ def get_user_analytics(
     with _conn() as con:
         rows = con.execute(sql, params).fetchall()
     result = _analytics_from_rows(rows)
+    result["period"] = {
+        "from": date_from,
+        "to": date_to,
+    }
+    return result
+
+
+def empty_user_analytics(
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    """Zeroed analytics payload when a scoped user has no bets yet."""
+    result = _analytics_from_rows([])
     result["period"] = {
         "from": date_from,
         "to": date_to,

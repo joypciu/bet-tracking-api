@@ -2035,24 +2035,66 @@ async def health():
 # ---------------------------------------------------------------------------
 
 
+async def _resolve_scoped_user_id(
+    auth_user: Optional[dict],
+    *,
+    email: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Resolve (user_id, email) for bet scoping.
+
+    api_key  → user_id from api_users (auth payload), no users-table lookup
+    cookie   → users table via JWT email
+    bearer   → users table via caller-supplied email
+    """
+    if auth_user and auth_user.get("auth_type") == "api_key":
+        return auth_user.get("user_id"), auth_user.get("email")
+
+    resolved_email: Optional[str] = None
+    if auth_user and auth_user.get("auth_type") == "cookie":
+        resolved_email = auth_user.get("email")
+    elif email:
+        resolved_email = email.strip().lower()
+
+    if not resolved_email:
+        return None, None
+
+    db_user = await run_in_threadpool(
+        bet_tracking.get_user_by_email, resolved_email
+    )
+    if db_user:
+        return db_user["user_id"], db_user["email"]
+    return None, resolved_email
+
+
+def _is_user_scoped_auth(auth_user: Optional[dict]) -> bool:
+    return bool(
+        auth_user and auth_user.get("auth_type") in ("cookie", "api_key")
+    )
+
+
 @app.post("/bets", tags=["bets"])
 async def create_bet(
     body: CreateBetRequest = Body(...),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
-    # Cookie auth  → always use JWT email, ignore body.email
-    # Bearer auth  → use body.email (service/script callers supply it)
-    if auth_user and auth_user.get("auth_type") in ("cookie", "api_key"):
-        resolved_email = auth_user.get("email")
-    else:
-        resolved_email = body.email
-
+    # api_key    → api_users.user_id (stored on user_bets)
+    # cookie     → users table via JWT email
+    # bearer     → users table via body.email
     user_id: Optional[str] = None
-    if resolved_email:
-        db_user = await run_in_threadpool(
-            bet_tracking.create_or_get_user, resolved_email
+    if auth_user and auth_user.get("auth_type") == "api_key":
+        user_id = auth_user.get("user_id")
+    else:
+        resolved_email = (
+            auth_user.get("email")
+            if auth_user and auth_user.get("auth_type") == "cookie"
+            else body.email
         )
-        user_id = db_user["user_id"]
+        if resolved_email:
+            db_user = await run_in_threadpool(
+                bet_tracking.create_or_get_user, resolved_email
+            )
+            user_id = db_user["user_id"]
 
     nvig_at_placement = _resolve_nvig_at_placement(
         body.odds, body.nvig_odds_at_placement, body.counterpart_odds
@@ -2111,30 +2153,20 @@ async def list_bets(
     offset: int = Query(0, ge=0),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
-    # Cookie / API key auth → always scope to token email, ignore ?email= param
-    # Bearer auth → use ?email= query param if provided
-    if auth_user and auth_user.get("auth_type") in ("cookie", "api_key"):
-        resolved_email = auth_user.get("email")
-    else:
-        resolved_email = email
-
-    user_id: Optional[str] = None
-    if resolved_email:
-        db_user = await run_in_threadpool(
-            bet_tracking.get_user_by_email, resolved_email
+    user_id, resolved_email = await _resolve_scoped_user_id(
+        auth_user, email=email
+    )
+    if _is_user_scoped_auth(auth_user) and not user_id:
+        return JSONResponse(
+            {
+                "total": 0,
+                "returned": 0,
+                "offset": offset,
+                "limit": limit,
+                "filters": {"email": resolved_email},
+                "bets": [],
+            }
         )
-        if not db_user:
-            return JSONResponse(
-                {
-                    "total": 0,
-                    "returned": 0,
-                    "offset": offset,
-                    "limit": limit,
-                    "filters": {"email": resolved_email},
-                    "bets": [],
-                }
-            )
-        user_id = db_user["user_id"]
 
     bets, total = await run_in_threadpool(
         bet_tracking.list_bets,
@@ -2174,23 +2206,27 @@ async def bets_summary(
     email: Optional[str] = Query(None),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
-    # Cookie / API key auth → always scope to token email
-    # Bearer auth → use ?email= query param if provided
-    if auth_user and auth_user.get("auth_type") in ("cookie", "api_key"):
-        resolved_email = auth_user.get("email")
-    else:
-        resolved_email = email
-
-    user_id: str | None = None
-    if resolved_email:
-        db_user = await run_in_threadpool(
-            bet_tracking.get_user_by_email, resolved_email.strip().lower()
-        )
-        if not db_user:
-            raise HTTPException(
-                status_code=404, detail=f"No user found for email '{resolved_email}'"
+    user_id, resolved_email = await _resolve_scoped_user_id(
+        auth_user, email=email
+    )
+    if _is_user_scoped_auth(auth_user):
+        if not user_id:
+            return JSONResponse(
+                {
+                    "total_bets": 0,
+                    "by_status": {},
+                    "total_staked": 0.0,
+                    "pending": 0,
+                    "settled": 0,
+                }
             )
-        user_id = db_user["user_id"]
+        summary = await run_in_threadpool(bet_tracking.get_summary, user_id)
+        return JSONResponse(summary)
+
+    if resolved_email and not user_id:
+        raise HTTPException(
+            status_code=404, detail=f"No user found for email '{resolved_email}'"
+        )
     summary = await run_in_threadpool(bet_tracking.get_summary, user_id)
     return JSONResponse(summary)
 
@@ -2218,31 +2254,51 @@ async def bets_analytics(
             status_code=400, detail="date_from must be on or before date_to"
         )
 
-    # Cookie / API key auth → always scope to token email
-    # Bearer auth → use ?email= query param if provided
-    if auth_user and auth_user.get("auth_type") in ("cookie", "api_key"):
-        resolved_email = auth_user.get("email")
-    else:
-        resolved_email = email
+    user_id, resolved_email = await _resolve_scoped_user_id(
+        auth_user, email=email
+    )
 
-    if resolved_email:
-        db_user = await run_in_threadpool(
-            bet_tracking.get_user_by_email, resolved_email.strip().lower()
-        )
-        if db_user:
+    if _is_user_scoped_auth(auth_user):
+        if not user_id:
             analytics = await run_in_threadpool(
-                bet_tracking.get_user_analytics,
-                db_user["user_id"],
-                date_from,
-                date_to,
+                bet_tracking.empty_user_analytics, date_from, date_to
             )
             return JSONResponse(
                 {
-                    "user": {"user_id": db_user["user_id"], "email": db_user["email"]},
+                    "user": {"user_id": None, "email": resolved_email},
                     "period_label": period,
                     **analytics,
                 }
             )
+        analytics = await run_in_threadpool(
+            bet_tracking.get_user_analytics,
+            user_id,
+            date_from,
+            date_to,
+        )
+        return JSONResponse(
+            {
+                "user": {"user_id": user_id, "email": resolved_email},
+                "period_label": period,
+                **analytics,
+            }
+        )
+
+    if resolved_email and user_id:
+        analytics = await run_in_threadpool(
+            bet_tracking.get_user_analytics,
+            user_id,
+            date_from,
+            date_to,
+        )
+        return JSONResponse(
+            {
+                "user": {"user_id": user_id, "email": resolved_email},
+                "period_label": period,
+                **analytics,
+            }
+        )
+
     analytics = await run_in_threadpool(
         bet_tracking.get_analytics, date_from, date_to
     )
@@ -2583,24 +2639,35 @@ async def settle_pending_bets_for_user(
     body: BulkSettleRequest = Body(...),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
-    # Cookie / API key auth → always use token email, ignore body.email
-    # Bearer auth → use body.email (service/script callers supply it)
-    if auth_user and auth_user.get("auth_type") in ("cookie", "api_key"):
-        resolved_email = auth_user.get("email")
-    else:
-        resolved_email = body.email
-
-    if not resolved_email:
+    user_id, resolved_email = await _resolve_scoped_user_id(
+        auth_user, email=body.email
+    )
+    if not user_id:
+        if _is_user_scoped_auth(auth_user):
+            return JSONResponse(
+                {
+                    "found": True,
+                    "summary": {
+                        "email": resolved_email,
+                        "user_id": auth_user.get("user_id") if auth_user else None,
+                        "total_pending": 0,
+                        "processed": 0,
+                        "skipped_not_started": 0,
+                        "win": 0,
+                        "loss": 0,
+                        "push": 0,
+                        "void": 0,
+                        "pending": 0,
+                        "manual_settlement_needed": 0,
+                        "unknown": 0,
+                        "errors": 0,
+                    },
+                }
+            )
         raise HTTPException(
             status_code=400, detail="email is required (provide in body or log in)"
         )
-    db_user = await run_in_threadpool(bet_tracking.get_user_by_email, resolved_email)
-    if not db_user:
-        raise HTTPException(
-            status_code=404, detail=f"No user found for email '{resolved_email}'"
-        )
 
-    user_id = db_user["user_id"]
     pending_bets, _ = await run_in_threadpool(
         bet_tracking.list_bets,
         status="pending",
@@ -2773,16 +2840,12 @@ async def get_my_tracked_bets(
     if auth_user.get("auth_type") not in ("cookie", "api_key"):
         return JSONResponse([])
 
-    email = auth_user.get("email")
-    if not email:
-        return JSONResponse([])
-
-    db_user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
-    if not db_user:
+    user_id, _email = await _resolve_scoped_user_id(auth_user)
+    if not user_id:
         return JSONResponse([])
 
     tracked_bets = await run_in_threadpool(
-        bet_tracking.get_tracked_historics_contexts, db_user["user_id"]
+        bet_tracking.get_tracked_historics_contexts, user_id
     )
     return JSONResponse(tracked_bets)
 

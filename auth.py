@@ -251,14 +251,80 @@ async def check_auth_token(tracking_auth_token: str = Cookie(None)):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-@router.post("/auth/logout")
-async def logout(request: Request):
-    """Clear the tracking_auth_token cookie."""
-    origin = request.headers.get("origin", "")
+def _lookup_api_user(api_key: str) -> dict | None:
+    """Return api user dict if key is valid and active, else None."""
+    if not api_key or not api_key.strip():
+        return None
+    key_hash = hashlib.sha256(api_key.strip().encode()).hexdigest()
+    api_user = bet_tracking.get_api_user_by_key_hash(key_hash)
+    if not api_user or not api_user.get("is_active"):
+        return None
+    return api_user
+
+
+def _external_user_payload(api_user: dict) -> dict:
+    return {
+        "user_id": api_user["user_id"],
+        "name": api_user["name"],
+        "email": api_user["email"],
+        "organization": api_user.get("organization"),
+    }
+
+
+def _clear_tracking_cookie(response: JSONResponse, origin: str) -> None:
     cookie_domain = _cookie_domain(origin)
-    response = JSONResponse({"message": "Logged out"})
     if cookie_domain:
         response.delete_cookie("tracking_auth_token", domain=cookie_domain)
     else:
         response.delete_cookie("tracking_auth_token")
+
+
+@router.post("/auth/external/login")
+async def external_login(request: Request):
+    """
+    Validate an API key for browser-based external user sessions.
+    Does NOT issue tracking_auth_token — the client stores the key and sends
+    X-API-Key on each request. Clears any existing tracking_auth_token cookie.
+    """
+    body = await request.json()
+    api_key = (body.get("api_key") or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="API key required")
+    api_user = await asyncio.to_thread(_lookup_api_user, api_key)
+    if not api_user:
+        raise HTTPException(status_code=401, detail="Invalid or inactive API key")
+
+    origin = request.headers.get("origin", "")
+    response = JSONResponse({
+        "authenticated": True,
+        "auth_type": "api_key",
+        "user": _external_user_payload(api_user),
+    })
+    _clear_tracking_cookie(response, origin)
+    return response
+
+
+@router.get("/auth/external/check")
+async def check_external_auth(request: Request):
+    """Check whether the X-API-Key header is valid."""
+    api_key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+    if not api_key:
+        raise HTTPException(status_code=401, detail="No API key provided")
+    api_user = await asyncio.to_thread(_lookup_api_user, api_key)
+    if not api_user:
+        raise HTTPException(status_code=401, detail="Invalid or inactive API key")
+    print(f"[AUTH] External check valid for: {api_user.get('email')}")
+    return {
+        "authenticated": True,
+        "auth_type": "api_key",
+        "user": _external_user_payload(api_user),
+    }
+
+
+@router.post("/auth/logout")
+async def logout(request: Request):
+    """Clear the tracking_auth_token cookie."""
+    origin = request.headers.get("origin", "")
+    response = JSONResponse({"message": "Logged out"})
+    _clear_tracking_cookie(response, origin)
     return response
