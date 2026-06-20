@@ -1259,6 +1259,17 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
             return stake + stake * (american_odds / 100)
         return stake + stake * (100 / abs(american_odds))
 
+    def _unit_profit(status: str, american_odds: float | None, stake: float) -> float | None:
+        if status == "win":
+            return _payout(american_odds, stake) - stake
+        if status == "loss":
+            return -stake
+        if status == "push":
+            return 0.0
+        return None
+
+    by_date_daily: dict[str, float] = {}
+
     for r in rows:
         status = r["status"]
         market = r["market"] or "unknown"
@@ -1316,6 +1327,11 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
         ):
             book_clv_list.append(float(r["book_clv"]))
 
+        unit_profit = _unit_profit(status, odds, stake)
+        event_date = r["date"]
+        if unit_profit is not None and event_date:
+            by_date_daily[event_date] = by_date_daily.get(event_date, 0.0) + unit_profit
+
     settled = settled_wins + settled_losses + settled_pushes
     win_rate = round(settled_wins / settled * 100, 1) if settled else None
     roi = (
@@ -1336,6 +1352,19 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
             v["win_rate"] = round(v["wins"] / total_g * 100, 1) if total_g else None
         return d
 
+    cumulative_units = 0.0
+    by_date: list[dict[str, Any]] = []
+    for day in sorted(by_date_daily.keys()):
+        daily_units = round(by_date_daily[day], 2)
+        cumulative_units = round(cumulative_units + daily_units, 2)
+        by_date.append(
+            {
+                "date": day,
+                "daily_units": daily_units,
+                "cumulative_units": cumulative_units,
+            }
+        )
+
     return {
         "settled_bets": settled,
         "pending_bets": sum(v.get("pending", 0) for v in by_market.values()),
@@ -1353,6 +1382,7 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
         "by_market": _clean(by_market),
         "by_sport": _clean(by_sport),
         "by_book": _clean(by_book),
+        "by_date": by_date,
     }
 
 

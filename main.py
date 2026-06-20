@@ -827,6 +827,66 @@ async def _espn_fetch_competition(bet: dict) -> tuple[dict | None, str | None]:
     return None, None
 
 
+def _market_stat_from_period_detail(period_det: dict) -> float | None:
+    """Extract the market-relevant numeric result from ESPN period settlement detail."""
+    if not period_det:
+        return None
+    for key in (
+        "ht_total",
+        "q1_total",
+        "first_half_total",
+        "second_half_total",
+        "p1_total",
+        "p2_total",
+        "1st_inn_total",
+        "first_3inn_total",
+        "first_5inn_total",
+    ):
+        if key in period_det:
+            return float(period_det[key])
+    pick_key = next((k for k in period_det if k.startswith("pick_")), None)
+    opp_key = next((k for k in period_det if k.startswith("opp_")), None)
+    if pick_key and opp_key:
+        return float(period_det[pick_key]) - float(period_det[opp_key])
+    if pick_key:
+        return float(period_det[pick_key])
+    return None
+
+
+def _normalize_settlement_score(
+    score: dict | None = None,
+    *,
+    home: float | int | None = None,
+    away: float | int | None = None,
+) -> dict | None:
+    if isinstance(score, dict) and score:
+        out = dict(score)
+        if out.get("total") is None and out.get("home") is not None and out.get("away") is not None:
+            out["total"] = out["home"] + out["away"]
+        return out
+    if home is not None or away is not None:
+        total = (home + away) if home is not None and away is not None else None
+        return {"home": home, "away": away, "total": total}
+    return None
+
+
+def _settlement_stat_fields(
+    *,
+    stat_value: float | None = None,
+    stat_name: str | None = None,
+    player_stat_value: float | None = None,
+    stored_stat_name: str | None = None,
+) -> dict:
+    value = stat_value if stat_value is not None else player_stat_value
+    name = stat_name or stored_stat_name
+    fields: dict = {}
+    if value is not None:
+        fields["stat_value"] = value
+    if name:
+        fields["stat_name"] = name
+    return fields
+
+
 async def _espn_settle_period_bet(bet: dict) -> dict | None:
     """Settle period/half/inning markets using ESPN linescore data (free, no key needed)."""
     import httpx as _httpx
@@ -1118,10 +1178,14 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
     if outcome == "pending":
         return None
 
+    stat_value = _market_stat_from_period_detail(period_det)
+
     return {
         "outcome": outcome,
         "settled": True,
         "source": "espn_public",
+        "stat_value": stat_value,
+        "stat_name": market,
         "score": {
             "home": float(home_comp.get("score", 0) or 0),
             "away": float(away_comp.get("score", 0) or 0),
@@ -1538,6 +1602,8 @@ async def _build_settlement(bet: dict) -> dict:
                         cached_resp.get("source") or "shared_cache",
                         (cached_resp.get("score") or {}).get("home"),
                         (cached_resp.get("score") or {}).get("away"),
+                        cached.get("player_stat_value"),
+                        cached.get("stat_name"),
                     )
                 return cached_resp
 
@@ -1567,6 +1633,8 @@ async def _build_settlement(bet: dict) -> dict:
                 "espn_public",
                 (result.get("score") or {}).get("home"),
                 (result.get("score") or {}).get("away"),
+                result.get("stat_value"),
+                result.get("stat_name") or bet.get("market"),
             )
         if result:
             return result
@@ -1806,14 +1874,18 @@ async def _build_settlement(bet: dict) -> dict:
         as_ = result.get("away_score")
         score = {"home": hs, "away": as_} if hs is not None or as_ is not None else {}
 
+    score = _normalize_settlement_score(score)
+
     if outcome in {"win", "loss", "push"} and settled and source:
         await run_in_threadpool(
             bet_tracking.settle_bet,
             bet["bet_id"],
             outcome,
             source,
-            score.get("home"),
-            score.get("away"),
+            (score or {}).get("home"),
+            (score or {}).get("away"),
+            result.get("stat_value"),
+            result.get("stat_name") or result.get("market") or bet.get("market"),
         )
 
     return {
@@ -1824,28 +1896,26 @@ async def _build_settlement(bet: dict) -> dict:
         "pricing": result.get("pricing"),
         "note": result.get("note"),
         "event": result.get("event"),
+        **_settlement_stat_fields(
+            stat_value=result.get("stat_value"),
+            stat_name=result.get("stat_name") or result.get("market"),
+        ),
     }
 
 
 def _stored_settlement(bet: dict) -> dict:
     status = bet.get("status", "pending")
-    hs = bet.get("home_score")
-    as_ = bet.get("away_score")
-    score = (
-        {
-            "home": hs,
-            "away": as_,
-            "total": (hs + as_) if hs is not None and as_ is not None else None,
-        }
-        if hs is not None or as_ is not None
-        else None
-    )
+    score = _normalize_settlement_score(home=bet.get("home_score"), away=bet.get("away_score"))
     return {
         "outcome": bet.get("outcome") or status,
         "settled": status not in ("pending", "void"),
         "source": bet.get("settlement_source"),
         "settled_at": bet.get("settled_at"),
         "score": score,
+        **_settlement_stat_fields(
+            player_stat_value=bet.get("player_stat_value"),
+            stored_stat_name=bet.get("stat_name"),
+        ),
     }
 
 
@@ -1870,16 +1940,9 @@ def _is_auto_settleable_bet(bet: dict) -> bool:
 def _shared_settlement_response(shared: dict) -> dict:
     status = shared.get("status")
     outcome = shared.get("outcome") or status or "pending"
-    hs = shared.get("home_score")
-    as_ = shared.get("away_score")
-    score = (
-        {
-            "home": hs,
-            "away": as_,
-            "total": (hs + as_) if hs is not None and as_ is not None else None,
-        }
-        if hs is not None or as_ is not None
-        else None
+    score = _normalize_settlement_score(
+        home=shared.get("home_score"),
+        away=shared.get("away_score"),
     )
     return {
         "outcome": outcome,
@@ -1890,6 +1953,10 @@ def _shared_settlement_response(shared: dict) -> dict:
         "score": score,
         "pricing": None,
         "note": "Loaded from shared settlement cache.",
+        **_settlement_stat_fields(
+            player_stat_value=shared.get("player_stat_value"),
+            stored_stat_name=shared.get("stat_name"),
+        ),
     }
 
 
