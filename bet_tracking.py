@@ -1422,7 +1422,7 @@ def _recent_graded_bets(
     date_to: str | None = None,
     *,
     user_id: str | None = None,
-    limit: int = 6,
+    limit: int = 5,
 ) -> list[dict[str, Any]]:
     where = ["status IN ('win', 'loss', 'push')"]
     params: list[Any] = []
