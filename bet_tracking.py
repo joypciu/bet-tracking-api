@@ -1239,6 +1239,7 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
     by_market: dict[str, dict] = {}
     by_sport: dict[str, dict] = {}
     by_book: dict[str, dict] = {}
+    by_league: dict[str, dict] = {}
 
     def _bucket(d: dict, key: str) -> dict:
         if key not in d:
@@ -1274,12 +1275,14 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
         status = r["status"]
         market = r["market"] or "unknown"
         sport = r["sport"] or "unknown"
+        league = r["league"] or sport or "unknown"
         book = r["book"] or "unknown"
         odds = r["odds"]
         stake = r["stake"] or 0.0
         mb = _bucket(by_market, market)
         sb = _bucket(by_sport, sport)
         bb = _bucket(by_book, book)
+        lb = _bucket(by_league, league)
 
         if status == "win":
             settled_wins += 1
@@ -1295,6 +1298,9 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
             bb["wins"] += 1
             bb["staked"] += stake
             bb["returned"] += payout
+            lb["wins"] += 1
+            lb["staked"] += stake
+            lb["returned"] += payout
         elif status == "loss":
             settled_losses += 1
             total_staked += stake
@@ -1304,6 +1310,8 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
             sb["staked"] += stake
             bb["losses"] += 1
             bb["staked"] += stake
+            lb["losses"] += 1
+            lb["staked"] += stake
         elif status == "push":
             settled_pushes += 1
             total_staked += stake
@@ -1317,10 +1325,14 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
             bb["pushes"] += 1
             bb["staked"] += stake
             bb["returned"] += stake
+            lb["pushes"] += 1
+            lb["staked"] += stake
+            lb["returned"] += stake
         elif status == "pending":
             mb["pending"] += 1
             sb["pending"] += 1
             bb["pending"] += 1
+            lb["pending"] += 1
 
         if status in ("win", "loss", "push") and _clv_valid_for_analytics(
             r["book_clv"], r["odds"]
@@ -1382,8 +1394,90 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
         "by_market": _clean(by_market),
         "by_sport": _clean(by_sport),
         "by_book": _clean(by_book),
+        "by_league": _clean(by_league),
         "by_date": by_date,
     }
+
+
+def _payout_from_odds(american_odds: float | None, stake: float) -> float:
+    if american_odds is None:
+        return stake
+    if american_odds >= 100:
+        return stake + stake * (american_odds / 100)
+    return stake + stake * (100 / abs(american_odds))
+
+
+def _unit_profit_from_bet(status: str, american_odds: float | None, stake: float) -> float | None:
+    if status == "win":
+        return _payout_from_odds(american_odds, stake) - stake
+    if status == "loss":
+        return -stake
+    if status == "push":
+        return 0.0
+    return None
+
+
+def _recent_graded_bets(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    *,
+    user_id: str | None = None,
+    limit: int = 6,
+) -> list[dict[str, Any]]:
+    where = ["status IN ('win', 'loss', 'push')"]
+    params: list[Any] = []
+    if user_id:
+        where.append("user_id = ?")
+        params.append(user_id)
+    if date_from or date_to:
+        where.append("date IS NOT NULL AND date != ''")
+    if date_from:
+        where.append("date >= ?")
+        params.append(date_from)
+    if date_to:
+        where.append("date <= ?")
+        params.append(date_to)
+
+    clause = " AND ".join(where)
+    sql = f"""
+        SELECT bet_id, status, sport, league, player, market, pick,
+               selection_line, event, date, book, odds, counterpart_odds,
+               stake, nvig_at_placement, settled_at, created_at
+        FROM user_bets
+        WHERE {clause}
+        ORDER BY COALESCE(settled_at, created_at) DESC
+        LIMIT ?
+    """
+    params.append(limit)
+
+    with _conn() as con:
+        rows = con.execute(sql, params).fetchall()
+
+    recent: list[dict[str, Any]] = []
+    for r in rows:
+        stake = r["stake"] or 0.0
+        unit_profit = _unit_profit_from_bet(r["status"], r["odds"], stake)
+        recent.append(
+            {
+                "bet_id": r["bet_id"],
+                "status": r["status"],
+                "sport": r["sport"],
+                "league": r["league"],
+                "player": r["player"],
+                "market": r["market"],
+                "pick": r["pick"],
+                "selection_line": r["selection_line"],
+                "event": r["event"],
+                "date": r["date"],
+                "book": r["book"],
+                "odds": r["odds"],
+                "counterpart_odds": r["counterpart_odds"],
+                "stake": round(stake, 2),
+                "nvig_at_placement": r["nvig_at_placement"],
+                "unit_profit": round(unit_profit, 2) if unit_profit is not None else None,
+            }
+        )
+    return recent
 
 
 def _analytics_date_clause(
@@ -1393,7 +1487,7 @@ def _analytics_date_clause(
     user_id: str | None = None,
 ) -> tuple[str, list[Any]]:
     sql = (
-        "SELECT status, market, sport, book, odds, stake, book_clv, date "
+        "SELECT status, market, sport, league, book, odds, stake, book_clv, date "
         "FROM user_bets WHERE 1=1"
     )
     params: list[Any] = []
@@ -1419,6 +1513,7 @@ def get_analytics(
     with _conn() as con:
         rows = con.execute(sql, params).fetchall()
     result = _analytics_from_rows(rows)
+    result["recent_bets"] = _recent_graded_bets(date_from, date_to)
     result["period"] = {
         "from": date_from,
         "to": date_to,
@@ -1439,6 +1534,9 @@ def get_user_analytics(
     with _conn() as con:
         rows = con.execute(sql, params).fetchall()
     result = _analytics_from_rows(rows)
+    result["recent_bets"] = _recent_graded_bets(
+        date_from, date_to, user_id=user_id
+    )
     result["period"] = {
         "from": date_from,
         "to": date_to,
@@ -1452,6 +1550,7 @@ def empty_user_analytics(
 ) -> dict[str, Any]:
     """Zeroed analytics payload when a scoped user has no bets yet."""
     result = _analytics_from_rows([])
+    result["recent_bets"] = []
     result["period"] = {
         "from": date_from,
         "to": date_to,
