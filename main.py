@@ -2216,7 +2216,7 @@ async def list_bets(
     book: Optional[str] = Query(None),
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(100, ge=1, le=200),
     offset: int = Query(0, ge=0),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
@@ -2230,6 +2230,8 @@ async def list_bets(
                 "returned": 0,
                 "offset": offset,
                 "limit": limit,
+                "page": (offset // limit) + 1 if limit else 1,
+                "total_pages": 0,
                 "filters": {"email": resolved_email},
                 "bets": [],
             }
@@ -2248,12 +2250,16 @@ async def list_bets(
         limit=limit,
         offset=offset,
     )
+    total_pages = (total + limit - 1) // limit if limit else 0
+    page = (offset // limit) + 1 if limit else 1
     return JSONResponse(
         {
             "total": total,
             "returned": len(bets),
             "offset": offset,
             "limit": limit,
+            "page": page,
+            "total_pages": total_pages,
             "filters": {
                 "status": status,
                 "sport": sport,
@@ -2266,6 +2272,22 @@ async def list_bets(
             "bets": [_bet_response(b, _stored_settlement(b)) for b in bets],
         }
     )
+
+
+@app.get("/bets/filter-options", tags=["bets"])
+async def bets_filter_options(
+    email: Optional[str] = Query(None),
+    auth_user: Optional[dict] = Depends(require_auth),
+) -> JSONResponse:
+    user_id, _resolved_email = await _resolve_scoped_user_id(
+        auth_user, email=email
+    )
+    if _is_user_scoped_auth(auth_user) and not user_id:
+        return JSONResponse({"markets": [], "books": []})
+    options = await run_in_threadpool(
+        bet_tracking.list_bet_filter_options, user_id
+    )
+    return JSONResponse(options)
 
 
 @app.get("/bets/summary", tags=["bets"])
@@ -2925,7 +2947,7 @@ async def user_bets(
     market: Optional[str] = Query(None),
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(100, ge=1, le=200),
     offset: int = Query(0, ge=0),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
@@ -2945,6 +2967,8 @@ async def user_bets(
         limit=limit,
         offset=offset,
     )
+    total_pages = (total + limit - 1) // limit if limit else 0
+    page = (offset // limit) + 1 if limit else 1
     return JSONResponse(
         {
             "user": {
@@ -2956,6 +2980,8 @@ async def user_bets(
             "returned": len(bets),
             "offset": offset,
             "limit": limit,
+            "page": page,
+            "total_pages": total_pages,
             "bets": [_bet_response(b) for b in bets],
         }
     )

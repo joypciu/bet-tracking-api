@@ -954,7 +954,7 @@ def list_bets(
     player: str | None = None,
     user_id: str | None = None,
     book: str | None = None,
-    limit: int = 50,
+    limit: int = 100,
     offset: int = 0,
 ) -> tuple[list[dict[str, Any]], int]:
     where: list[str] = []
@@ -996,6 +996,35 @@ def list_bets(
         ).fetchall()
 
     return [_row_to_dict(r) for r in rows], total  # type: ignore[misc]
+
+
+def list_bet_filter_options(user_id: str | None = None) -> dict[str, list[str]]:
+    """Distinct markets and books for filter dropdowns (no bet row payload)."""
+    where = "WHERE market IS NOT NULL AND TRIM(market) != ''"
+    book_where = "WHERE book IS NOT NULL AND TRIM(book) != ''"
+    params: list[Any] = []
+    if user_id:
+        where += " AND user_id = ?"
+        book_where += " AND user_id = ?"
+        params = [user_id]
+
+    with _conn() as con:
+        markets = [
+            row["market"]
+            for row in con.execute(
+                f"SELECT DISTINCT market FROM user_bets {where} ORDER BY market COLLATE NOCASE",
+                params,
+            ).fetchall()
+        ]
+        books = [
+            row["book"]
+            for row in con.execute(
+                f"SELECT DISTINCT book FROM user_bets {book_where} ORDER BY book COLLATE NOCASE",
+                params,
+            ).fetchall()
+        ]
+
+    return {"markets": markets, "books": books}
 
 
 def settle_bet(
