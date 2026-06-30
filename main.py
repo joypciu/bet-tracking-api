@@ -1697,6 +1697,22 @@ async def _build_settlement(bet: dict) -> dict:
         and bet.get("sport", "").lower() == "soccer"
     ):
         query_team = bet["player"]
+        _ht = home_team or bet.get("home_team")
+        _at = away_team or bet.get("away_team")
+        if _ht and _at:
+            _target = query_team.casefold()
+            if (
+                _target == _ht.casefold()
+                or _target in _ht.casefold()
+                or _ht.casefold() in _target
+            ):
+                query_opponent = _at
+            elif (
+                _target == _at.casefold()
+                or _target in _at.casefold()
+                or _at.casefold() in _target
+            ):
+                query_opponent = _ht
 
     # Normalise pick values that stats_api does not accept directly
     effective_pick = bet["pick"]
