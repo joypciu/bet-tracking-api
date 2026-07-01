@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 
 _STATS_URL = os.getenv("STATS_API_URL", "http://localhost:8001").rstrip("/")
 _TOKEN     = os.getenv("STATS_API_TOKEN", "").strip()
-_TIMEOUT   = float(os.getenv("STATS_API_TIMEOUT", "8.0"))
+_TIMEOUT   = float(os.getenv("STATS_API_TIMEOUT", "15.0"))
 
 
 class StatsBridgeHTTPError(Exception):
@@ -87,6 +87,7 @@ async def fetch_prop_check(
     date:     str | None,
     sport:    str | None,
     team:     str | None,
+    opponent: str | None = None,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {
         "player": player,
@@ -98,6 +99,7 @@ async def fetch_prop_check(
     if date:     params["date"]     = date
     if sport:    params["sport"]    = sport
     if team:     params["team"]     = team
+    if opponent: params["opponent"] = opponent
     return await _get("/stats/prop-check", params)
 
 

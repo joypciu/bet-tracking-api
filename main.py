@@ -1440,6 +1440,7 @@ async def _build_prop_settlement(bet: dict) -> dict:
         }
     event_id, home_team, away_team = await _resolve_game_for_bet(bet)
     primary_team = bet.get("team") or home_team
+    opponent_team = away_team if primary_team == home_team else home_team
     try:
         result = await sports_bridge.fetch_prop_check(
             player=player,
@@ -1450,6 +1451,7 @@ async def _build_prop_settlement(bet: dict) -> dict:
             date=bet.get("date"),
             sport=bet.get("sport"),
             team=primary_team,
+            opponent=opponent_team,
         )
     except sports_bridge.StatsBridgeHTTPError as exc:
         if exc.status_code == 404:
@@ -1505,6 +1507,7 @@ async def _build_prop_settlement(bet: dict) -> dict:
                                 date=rd,
                                 sport=rs,
                                 team=rt,
+                                opponent=opponent_team,
                             )
                             break
                         except sports_bridge.StatsBridgeHTTPError as retry_exc:
@@ -1556,6 +1559,8 @@ async def _build_prop_settlement(bet: dict) -> dict:
         }
     outcome = result.get("outcome", "pending")
     source = result.get("source", "historical")
+    if not result.get("settled"):
+        outcome = "pending"
     if outcome in {"win", "loss", "push"} and result.get("settled"):
         stat_value = result.get("stat_value")
         stat_name = result.get("market") or bet.get("market")
@@ -1879,6 +1884,8 @@ async def _build_settlement(bet: dict) -> dict:
 
     outcome = result.get("outcome", "pending")
     settled = result.get("settled", False)
+    if not settled:
+        outcome = "pending"
     source = result.get("source")
 
     # stats_api market-check responses may return either:
