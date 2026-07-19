@@ -714,6 +714,35 @@ def _line_for_settlement(bet: dict) -> float | None:
         return None
 
 
+def _espn_status_void_reason(st_type: dict | None) -> str | None:
+    """
+    Return a human status label when ESPN marks the game unplayable.
+
+    Basketball bets on postponed/cancelled games are voided. Other sports keep
+    their existing pending behavior at the call site.
+    """
+    st = st_type or {}
+    blob = " ".join(
+        str(st.get(k) or "") for k in ("description", "detail", "name", "shortDetail")
+    ).lower()
+    if "postpone" in blob:
+        return "Postponed"
+    if "cancel" in blob:
+        return "Cancelled"
+    return None
+
+
+def _basketball_void_settlement(reason: str) -> dict:
+    return {
+        "outcome": "void",
+        "settled": True,
+        "source": "espn_public",
+        "score": None,
+        "pricing": None,
+        "note": f"Game {reason} - bet voided.",
+    }
+
+
 _TEAM_TOTAL_SEL_RE = re.compile(
     r"^(?P<team>.+?)\s+(?P<dir>over|under)\s+(?P<line>[-+]?\d+(?:\.\d+)?)\s*$",
     re.IGNORECASE,
@@ -974,16 +1003,22 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
     st = comp.get("status", {})
     st_type = st.get("type", {}) or {}
     st_desc = str(st_type.get("description") or "")
-    st_desc_l = st_desc.lower()
-    if any(tok in st_desc_l for tok in ("postpone", "cancel", "forfeit", "suspended")):
-        return {
-            "outcome": "pending",
-            "settled": False,
-            "source": "espn_public",
-            "score": None,
-            "pricing": None,
-            "note": f"Game {st_desc or 'unavailable'} - cannot settle period markets.",
-        }
+    # Postponed/cancelled/forfeit/suspended handling is basketball-only so
+    # baseball/hockey period settlement keeps its prior behavior.
+    if "basketball" in sport:
+        void_reason = _espn_status_void_reason(st_type)
+        if void_reason:
+            return _basketball_void_settlement(void_reason)
+        st_desc_l = st_desc.lower()
+        if any(tok in st_desc_l for tok in ("postpone", "cancel", "forfeit", "suspended")):
+            return {
+                "outcome": "pending",
+                "settled": False,
+                "source": "espn_public",
+                "score": None,
+                "pricing": None,
+                "note": f"Game {st_desc or 'unavailable'} - cannot settle period markets.",
+            }
     if st_type.get("state") != "post":
         return {
             "outcome": "pending",
@@ -1407,6 +1442,10 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
 
     st = target_comp.get("status", {})
     stt = st.get("type", {})
+    void_reason = _espn_status_void_reason(stt)
+    if void_reason and "basketball" in sport:
+        return _basketball_void_settlement(void_reason)
+
     is_final = stt.get("state") == "post"
 
     if not is_final:
@@ -1458,7 +1497,8 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
     pick_raw = (bet.get("pick") or "").lower()
     line_val = _line_for_settlement(bet)
     team_total_target: str | None = None
-    if market == "team_total":
+    # Restrict team_total ESPN grading to basketball so baseball/hockey paths stay unchanged.
+    if market == "team_total" and "basketball" in sport:
         team_total_target, ou_pick, tt_line = _team_total_for_settlement(bet)
         pick_raw = ou_pick
         if tt_line is not None:
@@ -1537,7 +1577,7 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
                     if total < float(line_val)
                     else ("push" if total == float(line_val) else "loss")
                 )
-    elif market == "team_total":
+    elif market == "team_total" and "basketball" in sport:
         if line_val is not None and pick_raw in {"over", "under"}:
             team_pts = float(pick_score)
             if pick_raw == "over":
@@ -1798,7 +1838,7 @@ async def _build_settlement(bet: dict) -> dict:
         result = await _espn_settle_period_bet(bet)
         if (
             result
-            and result.get("outcome") in {"win", "loss", "push"}
+            and result.get("outcome") in {"win", "loss", "push", "void"}
             and result.get("settled")
         ):
             await run_in_threadpool(
@@ -1828,13 +1868,13 @@ async def _build_settlement(bet: dict) -> dict:
             ),
         }
 
-    # Full-game team_total for non-soccer: settle from final team score via ESPN.
-    # (Soccer team_total continues through SofaScore below.)
-    if market == "team_total" and "soccer" not in sport:
+    # Full-game team_total for basketball only (NBA/WNBA): settle from final
+    # team score via ESPN. Soccer/baseball/hockey keep their existing paths.
+    if market == "team_total" and "basketball" in sport:
         espn_tt = await _espn_settle_bet(bet)
         if (
             espn_tt
-            and espn_tt.get("outcome") in {"win", "loss", "push"}
+            and espn_tt.get("outcome") in {"win", "loss", "push", "void"}
             and espn_tt.get("settled")
         ):
             await run_in_threadpool(
@@ -1910,9 +1950,9 @@ async def _build_settlement(bet: dict) -> dict:
             ):
                 query_opponent = _ht
 
-    # Basketball/etc team_total: parse "Seattle Storm Over 84.5" → team + over/under + line
+    # Basketball team_total only: parse "Seattle Storm Over 84.5" → team + over/under + line
     team_total_player = bet.get("player")
-    if _market == "team_total" and "soccer" not in (bet.get("sport") or "").lower():
+    if _market == "team_total" and "basketball" in (bet.get("sport") or "").lower():
         tt_team, tt_pick, tt_line = _team_total_for_settlement(bet)
         effective_pick = tt_pick
         if tt_line is not None:
@@ -2034,7 +2074,7 @@ async def _build_settlement(bet: dict) -> dict:
                 fallback = await _espn_settle_bet(bet)
                 if fallback is not None:
                     fb_outcome = fallback.get("outcome", "pending")
-                    if fb_outcome in {"win", "loss", "push"} and fallback.get(
+                    if fb_outcome in {"win", "loss", "push", "void"} and fallback.get(
                         "settled"
                     ):
                         fb_score = fallback.get("score") or {}
