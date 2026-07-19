@@ -524,6 +524,7 @@ _AUTO_SETTLEABLE = {
     "1st_set_will_there_be_a_tiebreak",
     "2nd_set_moneyline",
     "2nd_set_total_games",
+    "3rd_set_total_games",
     # ── Hockey — full-game (settled via SofaScore through stats_api) ──────────
     "both_teams_to_score_reg_time",
     # ── Hockey — 1st period ───────────────────────────────────────────────────
@@ -621,7 +622,7 @@ def _is_prop_market(market: str) -> bool:
 
 def _normalize_settlement_market(market: str) -> str:
     """Map upstream market names to stats_api settlement names."""
-    m = (market or "").strip().lower()
+    m = (market or "").strip().lower().replace(" ", "_")
     if m == "total_points":
         return "total"
     return m
