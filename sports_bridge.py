@@ -88,6 +88,7 @@ async def fetch_prop_check(
     sport:    str | None,
     team:     str | None,
     opponent: str | None = None,
+    league:   str | None = None,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {
         "player": player,
@@ -100,6 +101,7 @@ async def fetch_prop_check(
     if sport:    params["sport"]    = sport
     if team:     params["team"]     = team
     if opponent: params["opponent"] = opponent
+    if league:   params["league"]   = league
     return await _get("/stats/prop-check", params)
 
 

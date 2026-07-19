@@ -584,11 +584,23 @@ _MLB_MARKETCHECK_ROUTED = {
 
 # Period markets that can be auto-settled from ESPN linescore data
 _PERIOD_SETTLEABLE = {
-    # Basketball — quarter & half
+    # Basketball — quarter & half (ESPN linescores; covers NBA + WNBA)
     "1st_quarter_moneyline",
     "1st_quarter_point_spread",
     "1st_quarter_total_points",
     "1st_quarter_team_total",
+    "2nd_quarter_moneyline",
+    "2nd_quarter_point_spread",
+    "2nd_quarter_total_points",
+    "2nd_quarter_team_total",
+    "3rd_quarter_moneyline",
+    "3rd_quarter_point_spread",
+    "3rd_quarter_total_points",
+    "3rd_quarter_team_total",
+    "4th_quarter_moneyline",
+    "4th_quarter_point_spread",
+    "4th_quarter_total_points",
+    "4th_quarter_team_total",
     "1st_half_moneyline",
     "1st_half_point_spread",
     "1st_half_total_points",
@@ -596,6 +608,7 @@ _PERIOD_SETTLEABLE = {
     "1st_half_home_team_total",
     "1st_half_away_team_total",
     "2nd_half_moneyline",
+    "2nd_half_point_spread",
     "2nd_half_total_points",
     "2nd_half_team_total",
     "2nd_half_both_teams_to_score",
@@ -703,6 +716,78 @@ def _line_for_settlement(bet: dict) -> float | None:
         return None
 
 
+def _espn_status_void_reason(st_type: dict | None) -> str | None:
+    """
+    Return a human status label when ESPN marks the game unplayable.
+
+    Basketball bets on postponed/cancelled games are voided. Other sports keep
+    their existing pending behavior at the call site.
+    """
+    st = st_type or {}
+    blob = " ".join(
+        str(st.get(k) or "") for k in ("description", "detail", "name", "shortDetail")
+    ).lower()
+    if "postpone" in blob:
+        return "Postponed"
+    if "cancel" in blob:
+        return "Cancelled"
+    return None
+
+
+def _basketball_void_settlement(reason: str) -> dict:
+    return {
+        "outcome": "void",
+        "settled": True,
+        "source": "espn_public",
+        "score": None,
+        "pricing": None,
+        "note": f"Game {reason} - bet voided.",
+    }
+
+
+_TEAM_TOTAL_SEL_RE = re.compile(
+    r"^(?P<team>.+?)\s+(?P<dir>over|under)\s+(?P<line>[-+]?\d+(?:\.\d+)?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _team_total_for_settlement(bet: dict) -> tuple[str | None, str, float | None]:
+    """
+    Resolve (target_team, over|under, line) for team_total markets.
+
+    selection_line is preferred when present, e.g. 'Seattle Storm Over 84.5',
+    because `team` on the bet row is often the bettor's side / home team, not
+    the team whose points are being wagered.
+    """
+    line = _line_for_settlement(bet)
+    pick = str(bet.get("pick") or "").strip()
+    pick_l = pick.lower()
+
+    for raw in (str(bet.get("selection_line") or "").strip(), pick):
+        if not raw:
+            continue
+        m = _TEAM_TOTAL_SEL_RE.match(raw)
+        if m:
+            return (
+                m.group("team").strip(),
+                m.group("dir").lower(),
+                float(m.group("line")),
+            )
+
+    ou = pick_l if pick_l in {"over", "under"} else None
+    sel = str(bet.get("selection_line") or "")
+    m2 = re.search(r"\b(over|under)\b", sel, re.IGNORECASE)
+    if m2:
+        ou = m2.group(1).lower()
+        team_part = sel[: m2.start()].strip(" -–:")
+        if team_part:
+            return team_part, ou, line
+
+    if ou is None:
+        ou = "over"
+    return (bet.get("player") or bet.get("team") or None), ou, line
+
+
 def _is_future_game(bet: dict) -> bool:
     """Return True when bet is for a future game based on datetime/date fields."""
     event_dt_raw = bet.get("event_datetime") or bet.get("datetime")
@@ -765,33 +850,21 @@ async def _espn_fetch_competition(bet: dict) -> tuple[dict | None, str | None]:
     sport_path, league_path = espn_path
     url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/{league_path}/scoreboard"
 
-    try:
-        async with _httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(
-                url,
-                params={"dates": date.replace("-", ""), "limit": 100},
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            if r.status_code != 200:
-                return None, None
-            data = r.json()
-    except Exception:
-        return None, None
-
-    all_competitions: list[dict] = []
-    for event in data.get("events", []):
-        groupings = event.get("groupings")
-        comps = []
-        if groupings:
-            for g in groupings:
-                comps.extend(g.get("competitions", []))
-        else:
-            comps = event.get("competitions", [event])
-        for c in comps:
-            c["_event_id"] = event.get("id", "")
-            c["_league_path"] = league_path
-            c["_sport_path"] = sport_path
-        all_competitions.extend(comps)
+    # Tip-offs near UTC midnight are often indexed under the previous ESPN date
+    # (e.g. bet date 2026-07-16 with tip 2026-07-16T00:00Z → scoreboard 20260715).
+    # Keep ±1-day only for basketball — MLB series can collide on adjacent days.
+    dates_to_try: list[str] = [date.replace("-", "")]
+    if "basketball" in sport:
+        try:
+            base = datetime.strptime(str(date), "%Y-%m-%d").date()
+            dates_to_try.extend([
+                (base - timedelta(days=1)).strftime("%Y%m%d"),
+                (base + timedelta(days=1)).strftime("%Y%m%d"),
+            ])
+        except ValueError:
+            pass
+    seen_dates: set[str] = set()
+    dates_to_try = [d for d in dates_to_try if not (d in seen_dates or seen_dates.add(d))]
 
     home_want = (bet.get("home_team") or "").lower()
     away_want = (bet.get("away_team") or "").lower()
@@ -817,14 +890,43 @@ async def _espn_fetch_competition(bet: dict) -> tuple[dict | None, str | None]:
         w = wanted.lower()
         return any(w in n or n in w for n in name_list)
 
-    for comp in all_competitions:
-        names = _comp_names(comp)
-        if home_want and away_want:
-            if _name_matches(home_want, names) and _name_matches(away_want, names):
-                return comp, league_path
-        elif team_want:
-            if _name_matches(team_want, names):
-                return comp, league_path
+    for espn_date in dates_to_try:
+        try:
+            async with _httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    url,
+                    params={"dates": espn_date, "limit": 100},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+        except Exception:
+            continue
+
+        all_competitions: list[dict] = []
+        for event in data.get("events", []):
+            groupings = event.get("groupings")
+            comps = []
+            if groupings:
+                for g in groupings:
+                    comps.extend(g.get("competitions", []))
+            else:
+                comps = event.get("competitions", [event])
+            for c in comps:
+                c["_event_id"] = event.get("id", "")
+                c["_league_path"] = league_path
+                c["_sport_path"] = sport_path
+            all_competitions.extend(comps)
+
+        for comp in all_competitions:
+            names = _comp_names(comp)
+            if home_want and away_want:
+                if _name_matches(home_want, names) and _name_matches(away_want, names):
+                    return comp, league_path
+            elif team_want:
+                if _name_matches(team_want, names):
+                    return comp, league_path
 
     return None, None
 
@@ -903,14 +1005,32 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
         return None
 
     st = comp.get("status", {})
-    if st.get("type", {}).get("state") != "post":
+    st_type = st.get("type", {}) or {}
+    st_desc = str(st_type.get("description") or "")
+    # Postponed/cancelled/forfeit/suspended handling is basketball-only so
+    # baseball/hockey period settlement keeps its prior behavior.
+    if "basketball" in sport:
+        void_reason = _espn_status_void_reason(st_type)
+        if void_reason:
+            return _basketball_void_settlement(void_reason)
+        st_desc_l = st_desc.lower()
+        if any(tok in st_desc_l for tok in ("postpone", "cancel", "forfeit", "suspended")):
+            return {
+                "outcome": "pending",
+                "settled": False,
+                "source": "espn_public",
+                "score": None,
+                "pricing": None,
+                "note": f"Game {st_desc or 'unavailable'} - cannot settle period markets.",
+            }
+    if st_type.get("state") != "post":
         return {
             "outcome": "pending",
             "settled": False,
             "source": "espn_public",
             "score": None,
             "pricing": None,
-            "note": f"Game not yet final — {st.get('type', {}).get('description', 'in progress')}",
+            "note": f"Game not yet final — {st_desc or 'in progress'}",
         }
 
     competitors = comp.get("competitors", [])
@@ -923,17 +1043,22 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
         competitors[1] if len(competitors) > 1 else {},
     )
 
-    # ── Soccer: fetch halftime from summary endpoint ──────────────────────────
+    # ── Soccer / basketball: fetch period linescores from summary when missing ─
     is_soccer = (
         "soccer" in sport
         or "football" in sport
         or "soccer" in (comp.get("_sport_path") or "")
     )
-    if is_soccer:
+    is_basketball = "basketball" in sport or "basketball" in (
+        comp.get("_sport_path") or ""
+    )
+    needs_linescores = is_soccer or is_basketball
+    if needs_linescores:
         event_id = comp.get("_event_id", "")
-        lp = comp.get("_league_path", league_path or "eng.1")
+        lp = comp.get("_league_path", league_path or ("eng.1" if is_soccer else "nba"))
+        sp = comp.get("_sport_path") or ("soccer" if is_soccer else "basketball")
         summary_url = (
-            f"https://site.api.espn.com/apis/site/v2/sports/soccer/{lp}/summary"
+            f"https://site.api.espn.com/apis/site/v2/sports/{sp}/{lp}/summary"
         )
         try:
             async with _httpx.AsyncClient(timeout=10.0) as client:
@@ -950,12 +1075,18 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
                             if ha == "home":
                                 home_comp = {
                                     **home_comp,
-                                    "linescores": c.get("linescores", []),
+                                    "linescores": c.get("linescores")
+                                    or home_comp.get("linescores")
+                                    or [],
+                                    "score": c.get("score", home_comp.get("score")),
                                 }
                             elif ha == "away":
                                 away_comp = {
                                     **away_comp,
-                                    "linescores": c.get("linescores", []),
+                                    "linescores": c.get("linescores")
+                                    or away_comp.get("linescores")
+                                    or [],
+                                    "score": c.get("score", away_comp.get("score")),
                                 }
         except Exception:
             pass
@@ -983,23 +1114,47 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
     bet_home = (bet.get("home_team") or "").lower()
     bet_away = (bet.get("away_team") or "").lower()
 
-    def _pick_side_matches(side_name: str, side_abbr: str, side_bet: str) -> bool:
+    def _pick_side_matches(side_name: str, side_abbr: str, side_bet: str, hint: str) -> bool:
         return (
-            pick_raw == side_abbr
-            or pick_raw in side_name
-            or side_name in pick_raw
-            or (side_bet and (pick_raw in side_bet or side_bet in pick_raw))
+            hint == side_abbr
+            or hint in side_name
+            or side_name in hint
+            or (side_bet and (hint in side_bet or side_bet in hint))
         )
 
+    # For team_total markets, pick is often just over/under. Resolve the target
+    # team from selection_line / team / player (same parser as full-game team_total).
+    side_hint = pick_raw
+    if market.endswith("team_total"):
+        if market.endswith("home_team_total"):
+            side_hint = "home"
+        elif market.endswith("away_team_total"):
+            side_hint = "away"
+        else:
+            tt_team, tt_ou, tt_line = _team_total_for_settlement(bet)
+            if tt_ou in {"over", "under"}:
+                pick_raw = tt_ou
+            if tt_line is not None:
+                line_val = tt_line
+            if tt_team:
+                side_hint = tt_team.lower()
+            elif bet.get("team"):
+                side_hint = str(bet.get("team")).lower()
+            elif bet.get("player"):
+                side_hint = str(bet.get("player")).lower()
+
     # Resolve pick side
-    if pick_raw == "home":
+    if side_hint == "home":
         pick_scores, opp_scores = home_scores, away_scores
-    elif pick_raw == "away":
+    elif side_hint == "away":
         pick_scores, opp_scores = away_scores, home_scores
-    elif _pick_side_matches(home_name.lower(), home_abbr, bet_home):
+    elif _pick_side_matches(home_name.lower(), home_abbr, bet_home, side_hint):
         pick_scores, opp_scores = home_scores, away_scores
-    elif _pick_side_matches(away_name.lower(), away_abbr, bet_away):
+    elif _pick_side_matches(away_name.lower(), away_abbr, bet_away, side_hint):
         pick_scores, opp_scores = away_scores, home_scores
+    elif market.endswith("team_total"):
+        # Prefer home over the old blind away default when pick is only over/under.
+        pick_scores, opp_scores = home_scores, away_scores
     else:
         pick_scores, opp_scores = away_scores, home_scores
 
@@ -1019,9 +1174,7 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
         return "win" if total < line else ("push" if total == line else "loss")
 
     def _team_total(ps: float, line: float, pick: str) -> str:
-        if pick in ("over", "home", "away"):
-            pick_dir = "over" if pick == "over" else pick_raw
-        pick_dir = pick_raw
+        pick_dir = pick if pick in ("over", "under") else pick_raw
         if pick_dir == "over":
             return "win" if ps > line else ("push" if ps == line else "loss")
         return "win" if ps < line else ("push" if ps == line else "loss")
@@ -1029,26 +1182,41 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
     outcome = "pending"
     period_det: dict = {}
 
-    # ── Basketball ────────────────────────────────────────────────────────────
-    if market == "1st_quarter_moneyline":
-        ps, os = _sum(pick_scores, [1]), _sum(opp_scores, [1])
-        period_det = {"pick_q1": ps, "opp_q1": os}
-        outcome = _ml(ps, os)
+    # ── Basketball quarters ───────────────────────────────────────────────────
+    _Q_PERIODS = {
+        "1st_quarter": [1],
+        "2nd_quarter": [2],
+        "3rd_quarter": [3],
+        "4th_quarter": [4],
+    }
 
-    elif market == "1st_quarter_point_spread" and line_val is not None:
-        ps, os = _sum(pick_scores, [1]), _sum(opp_scores, [1])
-        period_det = {"pick_q1": ps, "opp_q1": os}
-        outcome = _spread(ps, os, float(line_val))
+    def _quarter_prefix(mkt: str) -> str | None:
+        for prefix in _Q_PERIODS:
+            if mkt.startswith(prefix + "_"):
+                return prefix
+        return None
 
-    elif market == "1st_quarter_total_points" and line_val is not None:
-        total = _sum(home_scores, [1]) + _sum(away_scores, [1])
-        period_det = {"q1_total": total}
-        outcome = _total(total, float(line_val), pick_raw)
-
-    elif market == "1st_quarter_team_total" and line_val is not None:
-        ps = _sum(pick_scores, [1])
-        period_det = {"pick_q1": ps}
-        outcome = _team_total(ps, float(line_val), pick_raw)
+    q_prefix = _quarter_prefix(market)
+    if q_prefix:
+        periods = _Q_PERIODS[q_prefix]
+        q_key = q_prefix.split("_")[0]  # 1st / 2nd / ...
+        suffix = market[len(q_prefix) + 1 :]  # moneyline / point_spread / ...
+        if suffix == "moneyline":
+            ps, os = _sum(pick_scores, periods), _sum(opp_scores, periods)
+            period_det = {f"pick_{q_key}": ps, f"opp_{q_key}": os}
+            outcome = _ml(ps, os)
+        elif suffix == "point_spread" and line_val is not None:
+            ps, os = _sum(pick_scores, periods), _sum(opp_scores, periods)
+            period_det = {f"pick_{q_key}": ps, f"opp_{q_key}": os}
+            outcome = _spread(ps, os, float(line_val))
+        elif suffix == "total_points" and line_val is not None:
+            total = _sum(home_scores, periods) + _sum(away_scores, periods)
+            period_det = {f"{q_key}_total": total}
+            outcome = _total(total, float(line_val), pick_raw)
+        elif suffix == "team_total" and line_val is not None:
+            ps = _sum(pick_scores, periods)
+            period_det = {f"pick_{q_key}": ps}
+            outcome = _team_total(ps, float(line_val), pick_raw)
 
     elif market == "1st_half_moneyline":
         ps, os = _sum(pick_scores, [1, 2]), _sum(opp_scores, [1, 2])
@@ -1082,6 +1250,11 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
         ps, os = _sum(pick_scores, [3, 4]), _sum(opp_scores, [3, 4])
         period_det = {"pick_2h": ps, "opp_2h": os}
         outcome = _ml(ps, os)
+
+    elif market == "2nd_half_point_spread" and line_val is not None:
+        ps, os = _sum(pick_scores, [3, 4]), _sum(opp_scores, [3, 4])
+        period_det = {"pick_2h": ps, "opp_2h": os}
+        outcome = _spread(ps, os, float(line_val))
 
     elif market == "2nd_half_total_points" and line_val is not None:
         total = _sum(home_scores, [3, 4]) + _sum(away_scores, [3, 4])
@@ -1216,28 +1389,20 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
     sport_path, league_path = espn_path
     url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/{league_path}/scoreboard"
 
-    try:
-        async with _httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(
-                url,
-                params={"dates": date.replace("-", ""), "limit": 100},
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            if r.status_code != 200:
-                return None
-            data = r.json()
-    except Exception as exc:
-        print(f"[WARN] ESPN fallback fetch failed for {league_path}/{date}: {exc}")
-        return None
-
-    all_competitions: list[dict] = []
-    for event in data.get("events", []):
-        groupings = event.get("groupings")
-        if groupings:
-            for g in groupings:
-                all_competitions.extend(g.get("competitions", []))
-        else:
-            all_competitions.extend(event.get("competitions", [event]))
+    # ±1-day scoreboard lookup is basketball-only (UTC midnight tip-offs).
+    # Baseball/hockey use exact date to avoid adjacent-day series mismatches.
+    dates_to_try: list[str] = [str(date).replace("-", "")]
+    if "basketball" in sport:
+        try:
+            base = datetime.strptime(str(date), "%Y-%m-%d").date()
+            dates_to_try.extend([
+                (base - timedelta(days=1)).strftime("%Y%m%d"),
+                (base + timedelta(days=1)).strftime("%Y%m%d"),
+            ])
+        except ValueError:
+            pass
+    seen_dates: set[str] = set()
+    dates_to_try = [d for d in dates_to_try if not (d in seen_dates or seen_dates.add(d))]
 
     home_want = (bet.get("home_team") or "").lower()
     away_want = (bet.get("away_team") or "").lower()
@@ -1264,24 +1429,54 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
         return any(w in n or n in w for n in name_list)
 
     target_comp = None
-    for comp in all_competitions:
-        all_names = _comp_names(comp)
-        if home_want and away_want:
-            if _name_matches(home_want, all_names) and _name_matches(
-                away_want, all_names
-            ):
-                target_comp = comp
-                break
-        elif team_want:
-            if _name_matches(team_want, all_names):
-                target_comp = comp
-                break
+    for espn_date in dates_to_try:
+        try:
+            async with _httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    url,
+                    params={"dates": espn_date, "limit": 100},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+        except Exception as exc:
+            print(f"[WARN] ESPN fallback fetch failed for {league_path}/{espn_date}: {exc}")
+            continue
+
+        all_competitions: list[dict] = []
+        for event in data.get("events", []):
+            groupings = event.get("groupings")
+            if groupings:
+                for g in groupings:
+                    all_competitions.extend(g.get("competitions", []))
+            else:
+                all_competitions.extend(event.get("competitions", [event]))
+
+        for comp in all_competitions:
+            all_names = _comp_names(comp)
+            if home_want and away_want:
+                if _name_matches(home_want, all_names) and _name_matches(
+                    away_want, all_names
+                ):
+                    target_comp = comp
+                    break
+            elif team_want:
+                if _name_matches(team_want, all_names):
+                    target_comp = comp
+                    break
+        if target_comp:
+            break
 
     if not target_comp:
         return None
 
     st = target_comp.get("status", {})
     stt = st.get("type", {})
+    void_reason = _espn_status_void_reason(stt)
+    if void_reason and "basketball" in sport:
+        return _basketball_void_settlement(void_reason)
+
     is_final = stt.get("state") == "post"
 
     if not is_final:
@@ -1331,9 +1526,26 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
 
     market = (bet.get("market") or "").lower()
     pick_raw = (bet.get("pick") or "").lower()
-    line_val = bet.get("line")
+    line_val = _line_for_settlement(bet)
+    team_total_target: str | None = None
+    # Restrict team_total ESPN grading to basketball so baseball/hockey paths stay unchanged.
+    if market == "team_total" and "basketball" in sport:
+        team_total_target, ou_pick, tt_line = _team_total_for_settlement(bet)
+        pick_raw = ou_pick
+        if tt_line is not None:
+            line_val = tt_line
 
-    if _name_matches(pick_raw, c0_names) or pick_raw == "home":
+    if team_total_target and (
+        _name_matches(team_total_target.lower(), c0_names)
+        or team_total_target.lower() == "home"
+    ):
+        pick_comp, opp_comp = c0, c1
+    elif team_total_target and (
+        _name_matches(team_total_target.lower(), c1_names)
+        or team_total_target.lower() == "away"
+    ):
+        pick_comp, opp_comp = c1, c0
+    elif _name_matches(pick_raw, c0_names) or pick_raw == "home":
         pick_comp, opp_comp = c0, c1
     elif _name_matches(pick_raw, c1_names) or pick_raw == "away":
         pick_comp, opp_comp = c1, c0
@@ -1381,7 +1593,7 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
                 outcome = "loss"
             else:
                 outcome = "push"
-    elif market in ("total", "over_under", "total_goals", "total_runs"):
+    elif market in ("total", "over_under", "total_goals", "total_runs", "total_points"):
         total = c0_score + c1_score
         if line_val is not None:
             if pick_raw == "over":
@@ -1396,6 +1608,21 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
                     if total < float(line_val)
                     else ("push" if total == float(line_val) else "loss")
                 )
+    elif market == "team_total" and "basketball" in sport:
+        if line_val is not None and pick_raw in {"over", "under"}:
+            team_pts = float(pick_score)
+            if pick_raw == "over":
+                outcome = (
+                    "win"
+                    if team_pts > float(line_val)
+                    else ("push" if team_pts == float(line_val) else "loss")
+                )
+            else:
+                outcome = (
+                    "win"
+                    if team_pts < float(line_val)
+                    else ("push" if team_pts == float(line_val) else "loss")
+                )
     elif market == "both_teams_to_score":
         bts = c0_score > 0 and c1_score > 0
         if pick_raw in ("yes", "over"):
@@ -1403,12 +1630,17 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
         elif pick_raw in ("no", "under"):
             outcome = "win" if not bts else "loss"
 
+    if outcome == "pending":
+        return None
+
     pick_name = _display_name(pick_comp)
     opp_name = _display_name(opp_comp)
     return {
         "outcome": outcome,
         "settled": True,
         "source": "espn_public",
+        "stat_value": float(pick_score) if market == "team_total" else None,
+        "stat_name": market if market == "team_total" else None,
         "score": {
             "home": c0_score,
             "away": c1_score,
@@ -1420,6 +1652,11 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
             "description": f"{pick_name} {pick_score} - {opp_score} {opp_name}",
         },
         "pricing": None,
+        "note": (
+            f"Auto-settled team_total for {pick_name} ({pick_raw} {line_val})"
+            if market == "team_total"
+            else None
+        ),
     }
 
 
@@ -1454,6 +1691,7 @@ async def _build_prop_settlement(bet: dict) -> dict:
             sport=bet.get("sport"),
             team=primary_team,
             opponent=opponent_team,
+            league=bet.get("league"),
         )
     except sports_bridge.StatsBridgeHTTPError as exc:
         if exc.status_code == 404:
@@ -1510,6 +1748,7 @@ async def _build_prop_settlement(bet: dict) -> dict:
                                 sport=rs,
                                 team=rt,
                                 opponent=opponent_team,
+                                league=bet.get("league"),
                             )
                             break
                         except sports_bridge.StatsBridgeHTTPError as retry_exc:
@@ -1660,6 +1899,27 @@ async def _build_settlement(bet: dict) -> dict:
             ),
         }
 
+    # Full-game team_total for basketball only (NBA/WNBA): settle from final
+    # team score via ESPN. Soccer/baseball/hockey keep their existing paths.
+    if market == "team_total" and "basketball" in sport:
+        espn_tt = await _espn_settle_bet(bet)
+        if (
+            espn_tt
+            and espn_tt.get("outcome") in {"win", "loss", "push", "void"}
+            and espn_tt.get("settled")
+        ):
+            await run_in_threadpool(
+                bet_tracking.settle_bet,
+                bet["bet_id"],
+                espn_tt["outcome"],
+                "espn_public",
+                (espn_tt.get("score") or {}).get("home"),
+                (espn_tt.get("score") or {}).get("away"),
+                espn_tt.get("stat_value"),
+                espn_tt.get("stat_name") or "team_total",
+            )
+            return espn_tt
+
     if not sports_bridge.is_available():
         return {
             "outcome": "unknown",
@@ -1721,8 +1981,17 @@ async def _build_settlement(bet: dict) -> dict:
             ):
                 query_opponent = _ht
 
+    # Basketball team_total only: parse "Seattle Storm Over 84.5" → team + over/under + line
+    team_total_player = bet.get("player")
+    if _market == "team_total" and "basketball" in (bet.get("sport") or "").lower():
+        tt_team, tt_pick, tt_line = _team_total_for_settlement(bet)
+        effective_pick = tt_pick
+        if tt_line is not None:
+            line_value = tt_line
+        if tt_team:
+            team_total_player = tt_team
+
     # Normalise pick values that stats_api does not accept directly
-    effective_pick = bet["pick"]
     if _market in (
         "both_teams_to_score",
         "1st_half_both_teams_to_score",
@@ -1748,7 +2017,7 @@ async def _build_settlement(bet: dict) -> dict:
             sport=bet.get("sport"),
             team=query_team,
             opponent=query_opponent,
-            player=bet.get("player"),
+            player=team_total_player,
             market=_market,
             pick=effective_pick,
             line=line_value,
