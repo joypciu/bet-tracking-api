@@ -850,15 +850,17 @@ async def _espn_fetch_competition(bet: dict) -> tuple[dict | None, str | None]:
 
     # Tip-offs near UTC midnight are often indexed under the previous ESPN date
     # (e.g. bet date 2026-07-16 with tip 2026-07-16T00:00Z → scoreboard 20260715).
+    # Keep ±1-day only for basketball — MLB series can collide on adjacent days.
     dates_to_try: list[str] = [date.replace("-", "")]
-    try:
-        base = datetime.strptime(str(date), "%Y-%m-%d").date()
-        dates_to_try.extend([
-            (base - timedelta(days=1)).strftime("%Y%m%d"),
-            (base + timedelta(days=1)).strftime("%Y%m%d"),
-        ])
-    except ValueError:
-        pass
+    if "basketball" in sport:
+        try:
+            base = datetime.strptime(str(date), "%Y-%m-%d").date()
+            dates_to_try.extend([
+                (base - timedelta(days=1)).strftime("%Y%m%d"),
+                (base + timedelta(days=1)).strftime("%Y%m%d"),
+            ])
+        except ValueError:
+            pass
     seen_dates: set[str] = set()
     dates_to_try = [d for d in dates_to_try if not (d in seen_dates or seen_dates.add(d))]
 
@@ -1110,23 +1112,47 @@ async def _espn_settle_period_bet(bet: dict) -> dict | None:
     bet_home = (bet.get("home_team") or "").lower()
     bet_away = (bet.get("away_team") or "").lower()
 
-    def _pick_side_matches(side_name: str, side_abbr: str, side_bet: str) -> bool:
+    def _pick_side_matches(side_name: str, side_abbr: str, side_bet: str, hint: str) -> bool:
         return (
-            pick_raw == side_abbr
-            or pick_raw in side_name
-            or side_name in pick_raw
-            or (side_bet and (pick_raw in side_bet or side_bet in pick_raw))
+            hint == side_abbr
+            or hint in side_name
+            or side_name in hint
+            or (side_bet and (hint in side_bet or side_bet in hint))
         )
 
+    # For team_total markets, pick is often just over/under. Resolve the target
+    # team from selection_line / team / player (same parser as full-game team_total).
+    side_hint = pick_raw
+    if market.endswith("team_total"):
+        if market.endswith("home_team_total"):
+            side_hint = "home"
+        elif market.endswith("away_team_total"):
+            side_hint = "away"
+        else:
+            tt_team, tt_ou, tt_line = _team_total_for_settlement(bet)
+            if tt_ou in {"over", "under"}:
+                pick_raw = tt_ou
+            if tt_line is not None:
+                line_val = tt_line
+            if tt_team:
+                side_hint = tt_team.lower()
+            elif bet.get("team"):
+                side_hint = str(bet.get("team")).lower()
+            elif bet.get("player"):
+                side_hint = str(bet.get("player")).lower()
+
     # Resolve pick side
-    if pick_raw == "home":
+    if side_hint == "home":
         pick_scores, opp_scores = home_scores, away_scores
-    elif pick_raw == "away":
+    elif side_hint == "away":
         pick_scores, opp_scores = away_scores, home_scores
-    elif _pick_side_matches(home_name.lower(), home_abbr, bet_home):
+    elif _pick_side_matches(home_name.lower(), home_abbr, bet_home, side_hint):
         pick_scores, opp_scores = home_scores, away_scores
-    elif _pick_side_matches(away_name.lower(), away_abbr, bet_away):
+    elif _pick_side_matches(away_name.lower(), away_abbr, bet_away, side_hint):
         pick_scores, opp_scores = away_scores, home_scores
+    elif market.endswith("team_total"):
+        # Prefer home over the old blind away default when pick is only over/under.
+        pick_scores, opp_scores = home_scores, away_scores
     else:
         pick_scores, opp_scores = away_scores, home_scores
 
@@ -1361,15 +1387,18 @@ async def _espn_settle_bet(bet: dict) -> dict | None:
     sport_path, league_path = espn_path
     url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/{league_path}/scoreboard"
 
+    # ±1-day scoreboard lookup is basketball-only (UTC midnight tip-offs).
+    # Baseball/hockey use exact date to avoid adjacent-day series mismatches.
     dates_to_try: list[str] = [str(date).replace("-", "")]
-    try:
-        base = datetime.strptime(str(date), "%Y-%m-%d").date()
-        dates_to_try.extend([
-            (base - timedelta(days=1)).strftime("%Y%m%d"),
-            (base + timedelta(days=1)).strftime("%Y%m%d"),
-        ])
-    except ValueError:
-        pass
+    if "basketball" in sport:
+        try:
+            base = datetime.strptime(str(date), "%Y-%m-%d").date()
+            dates_to_try.extend([
+                (base - timedelta(days=1)).strftime("%Y%m%d"),
+                (base + timedelta(days=1)).strftime("%Y%m%d"),
+            ])
+        except ValueError:
+            pass
     seen_dates: set[str] = set()
     dates_to_try = [d for d in dates_to_try if not (d in seen_dates or seen_dates.add(d))]
 
