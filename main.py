@@ -13,6 +13,7 @@ DB:   bets.db (SQLite, WAL mode) via BET_DB_PATH env var
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 from contextlib import asynccontextmanager
@@ -25,7 +26,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Body, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 load_dotenv()
@@ -1561,7 +1562,7 @@ async def _build_prop_settlement(bet: dict) -> dict:
     source = result.get("source", "historical")
     if not result.get("settled"):
         outcome = "pending"
-    if outcome in {"win", "loss", "push"} and result.get("settled"):
+    if outcome in {"win", "loss", "push", "void"} and result.get("settled"):
         stat_value = result.get("stat_value")
         stat_name = result.get("market") or bet.get("market")
         home_score = result.get("home_score")
@@ -1628,7 +1629,7 @@ async def _build_settlement(bet: dict) -> dict:
         result = await _espn_settle_period_bet(bet)
         if (
             result
-            and result.get("outcome") in {"win", "loss", "push"}
+            and result.get("outcome") in {"win", "loss", "push", "void"}
             and result.get("settled")
         ):
             await run_in_threadpool(
@@ -1834,7 +1835,7 @@ async def _build_settlement(bet: dict) -> dict:
                 fallback = await _espn_settle_bet(bet)
                 if fallback is not None:
                     fb_outcome = fallback.get("outcome", "pending")
-                    if fb_outcome in {"win", "loss", "push"} and fallback.get(
+                    if fb_outcome in {"win", "loss", "push", "void"} and fallback.get(
                         "settled"
                     ):
                         fb_score = fallback.get("score") or {}
@@ -1899,7 +1900,7 @@ async def _build_settlement(bet: dict) -> dict:
 
     score = _normalize_settlement_score(score)
 
-    if outcome in {"win", "loss", "push"} and settled and source:
+    if outcome in {"win", "loss", "push", "void"} and settled and source:
         await run_in_threadpool(
             bet_tracking.settle_bet,
             bet["bet_id"],
@@ -2746,36 +2747,219 @@ class BulkSettleRequest(BaseModel):
         return self
 
 
+def _empty_bulk_settle_summary(
+    *,
+    email: Optional[str] = None,
+    user_id: Optional[str] = None,
+    total_pending: int = 0,
+) -> dict:
+    return {
+        "email": email,
+        "user_id": user_id,
+        "total_pending": total_pending,
+        "processed": 0,
+        "skipped_not_started": 0,
+        "win": 0,
+        "loss": 0,
+        "push": 0,
+        "void": 0,
+        "pending": 0,
+        "manual_settlement_needed": 0,
+        "unknown": 0,
+        "errors": 0,
+    }
+
+
+def _bulk_settle_progress_snapshot(
+    summary: dict,
+    *,
+    checked: int = 0,
+    current: Optional[dict] = None,
+    phase: str = "idle",
+    last_outcome: Optional[str] = None,
+) -> dict:
+    settled = (
+        int(summary.get("win") or 0)
+        + int(summary.get("loss") or 0)
+        + int(summary.get("push") or 0)
+        + int(summary.get("void") or 0)
+    )
+    total = int(summary.get("total_pending") or 0)
+    return {
+        "checked": checked,
+        "total_pending": total,
+        "settled": settled,
+        "phase": phase,
+        "current": current,
+        "last_outcome": last_outcome,
+        "percent": int(round((checked / total) * 100)) if total > 0 else 100,
+        "summary": dict(summary),
+    }
+
+
+def _bet_settle_label(bet: dict) -> dict:
+    home = (bet.get("home_team") or "").strip()
+    away = (bet.get("away_team") or "").strip()
+    if home and away:
+        matchup = f"{away} @ {home}"
+    else:
+        matchup = (bet.get("team") or bet.get("player") or "Unknown matchup").strip()
+    return {
+        "bet_id": bet.get("bet_id"),
+        "matchup": matchup,
+        "market": bet.get("market"),
+        "pick": bet.get("pick"),
+        "sport": bet.get("sport"),
+        "date": bet.get("date"),
+    }
+
+
+def _sse_event(event_type: str, payload: dict) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(payload, default=str)}\n\n"
+
+
+async def _run_bulk_settle_pending(
+    *,
+    pending_bets: list,
+    summary: dict,
+):
+    """Yield progress dicts while settling pending bets sequentially."""
+    total = len(pending_bets)
+    summary["total_pending"] = total
+    yield {
+        "type": "start",
+        **_bulk_settle_progress_snapshot(
+            summary, checked=0, current=None, phase="starting"
+        ),
+    }
+
+    for index, bet in enumerate(pending_bets, start=1):
+        label = _bet_settle_label(bet)
+        yield {
+            "type": "progress",
+            **_bulk_settle_progress_snapshot(
+                summary,
+                checked=index - 1,
+                current=label,
+                phase="settling",
+            ),
+        }
+
+        if _is_future_game(bet):
+            summary["skipped_not_started"] += 1
+            yield {
+                "type": "progress",
+                **_bulk_settle_progress_snapshot(
+                    summary,
+                    checked=index,
+                    current=label,
+                    phase="skipped",
+                    last_outcome="not_started",
+                ),
+            }
+            continue
+
+        summary["processed"] += 1
+        try:
+            settlement = await _build_settlement(bet)
+        except Exception:
+            summary["errors"] += 1
+            yield {
+                "type": "progress",
+                **_bulk_settle_progress_snapshot(
+                    summary,
+                    checked=index,
+                    current=label,
+                    phase="error",
+                    last_outcome="error",
+                ),
+            }
+            continue
+
+        outcome = str(settlement.get("outcome") or "pending")
+
+        if outcome in {"win", "loss", "push", "void"}:
+            asyncio.ensure_future(_calculate_clv_for_bet(bet["bet_id"]))
+            summary[outcome] += 1
+        elif outcome == "not_settleable":
+            summary["manual_settlement_needed"] += 1
+        elif outcome == "unknown":
+            summary["unknown"] += 1
+            summary["manual_settlement_needed"] += 1
+        else:
+            summary["pending"] += 1
+
+        yield {
+            "type": "progress",
+            **_bulk_settle_progress_snapshot(
+                summary,
+                checked=index,
+                current=label,
+                phase="checked",
+                last_outcome=outcome,
+            ),
+        }
+
+    yield {
+        "type": "complete",
+        "found": True,
+        **_bulk_settle_progress_snapshot(
+            summary,
+            checked=total,
+            current=None,
+            phase="complete",
+        ),
+    }
+
+
 @app.post("/bets/settle-pending", tags=["bets"])
 async def settle_pending_bets_for_user(
+    request: Request,
     body: BulkSettleRequest = Body(...),
+    stream: bool = Query(
+        False,
+        description="If true, stream live SSE progress events while settling",
+    ),
     auth_user: Optional[dict] = Depends(require_auth),
-) -> JSONResponse:
+):
     user_id, resolved_email = await _resolve_scoped_user_id(
         auth_user, email=body.email
     )
     if not user_id:
         if _is_user_scoped_auth(auth_user):
-            return JSONResponse(
-                {
-                    "found": True,
-                    "summary": {
-                        "email": resolved_email,
-                        "user_id": auth_user.get("user_id") if auth_user else None,
-                        "total_pending": 0,
-                        "processed": 0,
-                        "skipped_not_started": 0,
-                        "win": 0,
-                        "loss": 0,
-                        "push": 0,
-                        "void": 0,
-                        "pending": 0,
-                        "manual_settlement_needed": 0,
-                        "unknown": 0,
-                        "errors": 0,
-                    },
-                }
+            empty = _empty_bulk_settle_summary(
+                email=resolved_email,
+                user_id=auth_user.get("user_id") if auth_user else None,
             )
+            if stream:
+
+                async def empty_stream():
+                    yield _sse_event(
+                        "start",
+                        _bulk_settle_progress_snapshot(
+                            empty, checked=0, phase="starting"
+                        ),
+                    )
+                    yield _sse_event(
+                        "complete",
+                        {
+                            "found": True,
+                            **_bulk_settle_progress_snapshot(
+                                empty, checked=0, phase="complete"
+                            ),
+                        },
+                    )
+
+                return StreamingResponse(
+                    empty_stream(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            return JSONResponse({"found": True, "summary": empty})
         raise HTTPException(
             status_code=400, detail="email is required (provide in body or log in)"
         )
@@ -2788,55 +2972,45 @@ async def settle_pending_bets_for_user(
         offset=0,
     )
 
-    summary = {
-        "email": body.email,
-        "user_id": user_id,
-        "total_pending": len(pending_bets),
-        "processed": 0,
-        "skipped_not_started": 0,
-        "win": 0,
-        "loss": 0,
-        "push": 0,
-        "void": 0,
-        "pending": 0,
-        "manual_settlement_needed": 0,
-        "unknown": 0,
-        "errors": 0,
-    }
-    for bet in pending_bets:
-        if _is_future_game(bet):
-            summary["skipped_not_started"] += 1
-            continue
-
-        summary["processed"] += 1
-        try:
-            settlement = await _build_settlement(bet)
-        except Exception as exc:
-            summary["errors"] += 1
-            continue
-
-        outcome = str(settlement.get("outcome") or "pending")
-        settled = bool(settlement.get("settled"))
-
-        if outcome in {"win", "loss", "push", "void"}:
-            asyncio.ensure_future(_calculate_clv_for_bet(bet["bet_id"]))
-
-        if outcome in {"win", "loss", "push", "void"}:
-            summary[outcome] += 1
-        elif outcome == "not_settleable":
-            summary["manual_settlement_needed"] += 1
-        elif outcome == "unknown":
-            summary["unknown"] += 1
-            summary["manual_settlement_needed"] += 1
-        else:
-            summary["pending"] += 1
-
-    return JSONResponse(
-        {
-            "found": True,
-            "summary": summary,
-        }
+    summary = _empty_bulk_settle_summary(
+        email=body.email,
+        user_id=user_id,
+        total_pending=len(pending_bets),
     )
+
+    if stream:
+
+        async def event_stream():
+            async for event in _run_bulk_settle_pending(
+                pending_bets=pending_bets,
+                summary=summary,
+            ):
+                # A frontend cancellation aborts the streaming request. Finish no
+                # additional bets once the current settlement check returns.
+                if await request.is_disconnected():
+                    break
+                event_type = event.pop("type", "progress")
+                yield _sse_event(event_type, event)
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    final_summary = summary
+    async for event in _run_bulk_settle_pending(
+        pending_bets=pending_bets,
+        summary=summary,
+    ):
+        if event.get("type") == "complete":
+            final_summary = event.get("summary") or summary
+
+    return JSONResponse({"found": True, "summary": final_summary})
 
 
 class ManualSettleRequest(BaseModel):
