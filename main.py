@@ -2405,8 +2405,11 @@ async def _resolve_scoped_user_id(
     Resolve (user_id, email) for bet scoping.
 
     api_key  → user_id from api_users (auth payload), no users-table lookup
-    cookie   → users table via JWT email
-    bearer   → users table via caller-supplied email
+    cookie   → users table via JWT email + auth_source='cookie'
+    bearer   → users table via caller-supplied email + auth_source='cookie'
+
+    Cookie and API-key identities are separate: the same email can exist in
+    both spaces without sharing bet history.
     """
     if auth_user and auth_user.get("auth_type") == "api_key":
         return auth_user.get("user_id"), auth_user.get("email")
@@ -2421,7 +2424,9 @@ async def _resolve_scoped_user_id(
         return None, None
 
     db_user = await run_in_threadpool(
-        bet_tracking.get_user_by_email, resolved_email
+        bet_tracking.get_user_by_email,
+        resolved_email,
+        auth_source=bet_tracking.AUTH_SOURCE_COOKIE,
     )
     if db_user:
         return db_user["user_id"], db_user["email"]
@@ -2440,8 +2445,8 @@ async def create_bet(
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
     # api_key    → api_users.user_id (stored on user_bets)
-    # cookie     → users table via JWT email
-    # bearer     → users table via body.email
+    # cookie     → users table via JWT email (auth_source=cookie)
+    # bearer     → users table via body.email (auth_source=cookie)
     user_id: Optional[str] = None
     if auth_user and auth_user.get("auth_type") == "api_key":
         user_id = auth_user.get("user_id")
@@ -2453,7 +2458,9 @@ async def create_bet(
         )
         if resolved_email:
             db_user = await run_in_threadpool(
-                bet_tracking.create_or_get_user, resolved_email
+                bet_tracking.create_or_get_user,
+                resolved_email,
+                auth_source=bet_tracking.AUTH_SOURCE_COOKIE,
             )
             user_id = db_user["user_id"]
 
@@ -3418,7 +3425,11 @@ async def user_bets(
     offset: int = Query(0, ge=0),
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
-    db_user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
+    db_user = await run_in_threadpool(
+        bet_tracking.get_user_by_email,
+        email,
+        auth_source=bet_tracking.AUTH_SOURCE_COOKIE,
+    )
     if not db_user:
         raise HTTPException(
             status_code=404, detail=f"No user found for email '{email}'"
@@ -3459,7 +3470,11 @@ async def user_stats(
     email: str,
     auth_user: Optional[dict] = Depends(require_auth),
 ) -> JSONResponse:
-    db_user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
+    db_user = await run_in_threadpool(
+        bet_tracking.get_user_by_email,
+        email,
+        auth_source=bet_tracking.AUTH_SOURCE_COOKIE,
+    )
     if not db_user:
         raise HTTPException(
             status_code=404, detail=f"No user found for email '{email}'"
@@ -3490,7 +3505,11 @@ async def user_analytics(
             status_code=400, detail="date_from must be on or before date_to"
         )
 
-    db_user = await run_in_threadpool(bet_tracking.get_user_by_email, email)
+    db_user = await run_in_threadpool(
+        bet_tracking.get_user_by_email,
+        email,
+        auth_source=bet_tracking.AUTH_SOURCE_COOKIE,
+    )
     if not db_user:
         raise HTTPException(
             status_code=404, detail=f"No user found for email '{email}'"

@@ -131,16 +131,90 @@ def _shared_settlement_to_bet_fields(settlement: dict[str, Any]) -> tuple:
     )
 
 
+def _migrate_users_auth_source(con: sqlite3.Connection) -> None:
+    """Add auth_source and tag api_users mirrors (safe inside a transaction)."""
+    user_cols = {
+        row["name"] for row in con.execute("PRAGMA table_info(users)").fetchall()
+    }
+    if "auth_source" not in user_cols:
+        con.execute(
+            "ALTER TABLE users ADD COLUMN auth_source TEXT NOT NULL DEFAULT 'cookie'"
+        )
+
+    con.execute(
+        """
+        UPDATE users
+        SET auth_source = CASE
+            WHEN user_id IN (SELECT user_id FROM api_users) THEN 'api_key'
+            ELSE 'cookie'
+        END
+        """
+    )
+
+
+def _rebuild_users_table_for_auth_source() -> None:
+    """
+    Drop legacy global UNIQUE(email) so the same email can exist once per
+    auth_source. Must run outside an open transaction (FK pragma requirement).
+    """
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        # FK mode can only change when no transaction is open.
+        con.execute("PRAGMA foreign_keys=OFF")
+
+        idx_sql = con.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'"
+        ).fetchone()
+        create_sql = (idx_sql["sql"] or "") if idx_sql else ""
+        # Legacy schema (possibly after ALTER ADD auth_source) still has
+        # column-level UNIQUE on email alone — that blocks cookie+api separation.
+        legacy_global_email_unique = bool(
+            re.search(r"\bemail\s+TEXT\s+UNIQUE\b", create_sql, re.IGNORECASE)
+        )
+
+        if legacy_global_email_unique:
+            con.execute("""
+                CREATE TABLE users_v2 (
+                    user_id     TEXT PRIMARY KEY,
+                    email       TEXT NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    auth_source TEXT NOT NULL DEFAULT 'cookie',
+                    UNIQUE (email, auth_source)
+                )
+            """)
+            con.execute("""
+                INSERT INTO users_v2 (user_id, email, created_at, auth_source)
+                SELECT user_id, email, created_at,
+                       COALESCE(NULLIF(TRIM(auth_source), ''), 'cookie')
+                FROM users
+            """)
+            con.execute("DROP TABLE users")
+            con.execute("ALTER TABLE users_v2 RENAME TO users")
+
+        con.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        con.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_auth_source "
+            "ON users(email, auth_source)"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
 def init_db() -> None:
     with _conn() as con:
         con.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id    TEXT PRIMARY KEY,
-                email      TEXT UNIQUE NOT NULL,
-                created_at TEXT NOT NULL
+                user_id     TEXT PRIMARY KEY,
+                email       TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                auth_source TEXT NOT NULL DEFAULT 'cookie',
+                UNIQUE (email, auth_source)
             )
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        # Composite unique index is ensured in _rebuild_users_table_for_auth_source.
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS bets (
@@ -369,6 +443,9 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_api_users_key_hash ON api_users(api_key_hash)"
         )
 
+        # Must run after api_users exists so mirrors can be tagged correctly.
+        _migrate_users_auth_source(con)
+
         # Backfill existing bets into shared_bets on first startup after migration.
         rows = con.execute("""
             SELECT bet_id, event_id, sport, league, date, event, event_datetime,
@@ -465,6 +542,9 @@ def init_db() -> None:
                 ),
             )
 
+    # Legacy UNIQUE(email) → UNIQUE(email, auth_source); must be outside the
+    # init transaction so PRAGMA foreign_keys=OFF takes effect.
+    _rebuild_users_table_for_auth_source()
     sync_api_user_mirrors()
 
 
@@ -554,27 +634,47 @@ def validate_email(email: str) -> str:
     return normalised
 
 
-def create_or_get_user(email: str) -> dict[str, Any]:
+AUTH_SOURCE_COOKIE = "cookie"
+AUTH_SOURCE_API_KEY = "api_key"
+
+
+def create_or_get_user(
+    email: str,
+    *,
+    auth_source: str = AUTH_SOURCE_COOKIE,
+) -> dict[str, Any]:
+    """Create/get a users row scoped to one login identity (cookie vs api_key)."""
+    if auth_source not in (AUTH_SOURCE_COOKIE, AUTH_SOURCE_API_KEY):
+        raise ValueError(f"Invalid auth_source: {auth_source!r}")
     normalised = validate_email(email)
     with _conn() as con:
         row = con.execute(
-            "SELECT * FROM users WHERE email = ?", (normalised,)
+            "SELECT * FROM users WHERE email = ? AND auth_source = ?",
+            (normalised, auth_source),
         ).fetchone()
         if row:
             return _row_to_dict(row)  # type: ignore[return-value]
         user_id = str(uuid.uuid4())
         created_at = datetime.now(timezone.utc).isoformat()
         con.execute(
-            "INSERT INTO users (user_id, email, created_at) VALUES (?,?,?)",
-            (user_id, normalised, created_at),
+            "INSERT INTO users (user_id, email, created_at, auth_source) "
+            "VALUES (?,?,?,?)",
+            (user_id, normalised, created_at, auth_source),
         )
-    return {"user_id": user_id, "email": normalised, "created_at": created_at}
+    return {
+        "user_id": user_id,
+        "email": normalised,
+        "created_at": created_at,
+        "auth_source": auth_source,
+    }
 
 
 def ensure_api_user_mirrored(user_id: str, email: str) -> dict[str, Any]:
     """
     Ensure an api_users identity also exists in users so user_bets FK is satisfied.
-    Uses api_users.user_id as the canonical id. Idempotent — safe to call on every bet.
+
+    Uses api_users.user_id as the canonical id and auth_source='api_key'.
+    Does not collide with Bettor Odds cookie users that share the same email.
     """
     normalised = validate_email(email)
     with _conn() as con:
@@ -582,10 +682,20 @@ def ensure_api_user_mirrored(user_id: str, email: str) -> dict[str, Any]:
             "SELECT * FROM users WHERE user_id = ?", (user_id,)
         ).fetchone()
         if row:
+            if row["auth_source"] != AUTH_SOURCE_API_KEY:
+                con.execute(
+                    "UPDATE users SET auth_source = ? WHERE user_id = ?",
+                    (AUTH_SOURCE_API_KEY, user_id),
+                )
+                row = con.execute(
+                    "SELECT * FROM users WHERE user_id = ?", (user_id,)
+                ).fetchone()
             return _row_to_dict(row)  # type: ignore[return-value]
 
+        # Only conflict if another api_key mirror already owns this email.
         email_row = con.execute(
-            "SELECT user_id FROM users WHERE email = ?", (normalised,)
+            "SELECT user_id FROM users WHERE email = ? AND auth_source = ?",
+            (normalised, AUTH_SOURCE_API_KEY),
         ).fetchone()
         if email_row and email_row["user_id"] != user_id:
             old_id = email_row["user_id"]
@@ -594,17 +704,23 @@ def ensure_api_user_mirrored(user_id: str, email: str) -> dict[str, Any]:
             ).fetchone()
             if has_bets:
                 raise ValueError(
-                    f"Email {normalised!r} is already linked to a different users "
-                    f"record with existing bets; contact support to migrate."
+                    f"Email {normalised!r} is already linked to a different "
+                    f"api_key users record with existing bets; contact support."
                 )
             con.execute("DELETE FROM users WHERE user_id = ?", (old_id,))
 
         created_at = datetime.now(timezone.utc).isoformat()
         con.execute(
-            "INSERT INTO users (user_id, email, created_at) VALUES (?,?,?)",
-            (user_id, normalised, created_at),
+            "INSERT INTO users (user_id, email, created_at, auth_source) "
+            "VALUES (?,?,?,?)",
+            (user_id, normalised, created_at, AUTH_SOURCE_API_KEY),
         )
-    return {"user_id": user_id, "email": normalised, "created_at": created_at}
+    return {
+        "user_id": user_id,
+        "email": normalised,
+        "created_at": created_at,
+        "auth_source": AUTH_SOURCE_API_KEY,
+    }
 
 
 def sync_api_user_mirrors() -> None:
@@ -615,11 +731,17 @@ def sync_api_user_mirrors() -> None:
         ensure_api_user_mirrored(row["user_id"], row["email"])
 
 
-def get_user_by_email(email: str) -> dict[str, Any] | None:
+def get_user_by_email(
+    email: str,
+    *,
+    auth_source: str = AUTH_SOURCE_COOKIE,
+) -> dict[str, Any] | None:
+    """Lookup by email within one login identity (default: Bettor Odds cookie)."""
     normalised = email.strip().lower()
     with _conn() as con:
         row = con.execute(
-            "SELECT * FROM users WHERE email = ?", (normalised,)
+            "SELECT * FROM users WHERE email = ? AND auth_source = ?",
+            (normalised, auth_source),
         ).fetchone()
     return _row_to_dict(row)
 
