@@ -1496,7 +1496,8 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
             by_date_daily[event_date] = by_date_daily.get(event_date, 0.0) + unit_profit
 
     settled = settled_wins + settled_losses + settled_pushes
-    win_rate = round(settled_wins / settled * 100, 1) if settled else None
+    decided = settled_wins + settled_losses
+    win_rate = round(settled_wins / decided * 100, 1) if decided else None
     roi = (
         round((total_returned - total_staked) / total_staked * 100, 2)
         if total_staked
@@ -1511,8 +1512,10 @@ def _analytics_from_rows(rows: list) -> dict[str, Any]:
             v["staked"] = round(v["staked"], 2)
             v["returned"] = round(v.get("returned", 0.0), 2)
             v["net"] = round(v["returned"] - v["staked"], 2)
-            total_g = v["wins"] + v["losses"] + v["pushes"]
-            v["win_rate"] = round(v["wins"] / total_g * 100, 1) if total_g else None
+            decided_g = v["wins"] + v["losses"]
+            v["win_rate"] = (
+                round(v["wins"] / decided_g * 100, 1) if decided_g else None
+            )
         return d
 
     cumulative_units = 0.0
