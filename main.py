@@ -499,6 +499,13 @@ _AUTO_SETTLEABLE = {
     "1st_half_total_points_odd_even",
     "2nd_half_total_points_odd_even",
     "1st_half_point_spread",
+    "1st_half_moneyline",
+    "1st_half_team_total",
+    "2nd_half_moneyline",
+    "2nd_half_point_spread",
+    "2nd_half_total_points",
+    "2nd_half_team_total",
+    "4th_quarter_total_points_odd_even",
     "1st_quarter_player_points",
     "2nd_quarter_player_points",
     "3rd_quarter_player_points",
@@ -510,6 +517,8 @@ _AUTO_SETTLEABLE = {
     "team_first_basket",
     "first_basket",
     "first_basket_including_ft",
+    "player_double_double",
+    "player_triple_double",
     # MMA markets
     "go_the_distance",
     "total_rounds",
@@ -1862,6 +1871,7 @@ async def _build_settlement(bet: dict) -> dict:
         market in _PERIOD_SETTLEABLE
         and sport
         != "soccer"  # soccer period markets route to SofaScore via _AUTO_SETTLEABLE
+        and "basketball" not in sport  # NBA/WNBA period → SofaScore via stats_api
         and not (sport == "baseball" and market in _MLB_MARKETCHECK_ROUTED)
     )
 
@@ -1899,26 +1909,8 @@ async def _build_settlement(bet: dict) -> dict:
             ),
         }
 
-    # Full-game team_total for basketball only (NBA/WNBA): settle from final
-    # team score via ESPN. Soccer/baseball/hockey keep their existing paths.
-    if market == "team_total" and "basketball" in sport:
-        espn_tt = await _espn_settle_bet(bet)
-        if (
-            espn_tt
-            and espn_tt.get("outcome") in {"win", "loss", "push", "void"}
-            and espn_tt.get("settled")
-        ):
-            await run_in_threadpool(
-                bet_tracking.settle_bet,
-                bet["bet_id"],
-                espn_tt["outcome"],
-                "espn_public",
-                (espn_tt.get("score") or {}).get("home"),
-                (espn_tt.get("score") or {}).get("away"),
-                espn_tt.get("stat_value"),
-                espn_tt.get("stat_name") or "team_total",
-            )
-            return espn_tt
+    # Full-game basketball team_total settles via SofaScore market-check
+    # (stats_api → basketball_sofascore_props), same as other NBA/WNBA markets.
 
     if not sports_bridge.is_available():
         return {
@@ -2845,42 +2837,49 @@ async def bets_prop_markets(
                 "player_strikeouts": "mlb_stats_api",
                 "player_earned_runs": "mlb_stats_api",
                 "player_outs": "mlb_stats_api",
-                "1st_quarter_player_points": "nba_period_props",
-                "2nd_quarter_player_points": "nba_period_props",
-                "3rd_quarter_player_points": "nba_period_props",
-                "4th_quarter_player_points": "nba_period_props",
-                "1st_half_player_points": "nba_period_props",
-                "2nd_half_player_points": "nba_period_props",
-                "1st_quarter_total_points": "nba_period_props",
-                "2nd_quarter_total_points": "nba_period_props",
-                "3rd_quarter_total_points": "nba_period_props",
-                "4th_quarter_total_points": "nba_period_props",
-                "1st_quarter_total_points_odd_even": "nba_period_props",
-                "2nd_quarter_total_points_odd_even": "nba_period_props",
-                "3rd_quarter_total_points_odd_even": "nba_period_props",
-                "1st_quarter_moneyline": "nba_period_props",
-                "2nd_quarter_moneyline": "nba_period_props",
-                "3rd_quarter_moneyline": "nba_period_props",
-                "4th_quarter_moneyline": "nba_period_props",
-                "1st_quarter_point_spread": "nba_period_props",
-                "2nd_quarter_point_spread": "nba_period_props",
-                "3rd_quarter_point_spread": "nba_period_props",
-                "4th_quarter_point_spread": "nba_period_props",
-                "1st_quarter_team_total": "nba_period_props",
-                "2nd_quarter_team_total": "nba_period_props",
-                "3rd_quarter_team_total": "nba_period_props",
-                "4th_quarter_team_total": "nba_period_props",
-                "1st_half_total_points": "nba_period_props",
-                "1st_half_total_points_odd_even": "nba_period_props",
-                "2nd_half_total_points_odd_even": "nba_period_props",
-                "1st_half_moneyline": "nba_period_props",
-                "1st_half_point_spread": "nba_period_props",
-                "1st_half_team_total": "nba_period_props",
-                "total_points_odd_even": "nba_period_props",
-                "will_there_be_overtime": "nba_period_props",
-                "team_first_basket": "nba_period_props",
-                "first_basket": "nba_period_props",
-                "first_basket_including_ft": "nba_period_props",
+                "1st_quarter_player_points": "sofascore_basketball",
+                "2nd_quarter_player_points": "sofascore_basketball",
+                "3rd_quarter_player_points": "sofascore_basketball",
+                "4th_quarter_player_points": "sofascore_basketball",
+                "1st_half_player_points": "sofascore_basketball",
+                "2nd_half_player_points": "sofascore_basketball",
+                "1st_quarter_total_points": "sofascore_basketball",
+                "2nd_quarter_total_points": "sofascore_basketball",
+                "3rd_quarter_total_points": "sofascore_basketball",
+                "4th_quarter_total_points": "sofascore_basketball",
+                "1st_quarter_total_points_odd_even": "sofascore_basketball",
+                "2nd_quarter_total_points_odd_even": "sofascore_basketball",
+                "3rd_quarter_total_points_odd_even": "sofascore_basketball",
+                "4th_quarter_total_points_odd_even": "sofascore_basketball",
+                "1st_quarter_moneyline": "sofascore_basketball",
+                "2nd_quarter_moneyline": "sofascore_basketball",
+                "3rd_quarter_moneyline": "sofascore_basketball",
+                "4th_quarter_moneyline": "sofascore_basketball",
+                "1st_quarter_point_spread": "sofascore_basketball",
+                "2nd_quarter_point_spread": "sofascore_basketball",
+                "3rd_quarter_point_spread": "sofascore_basketball",
+                "4th_quarter_point_spread": "sofascore_basketball",
+                "1st_quarter_team_total": "sofascore_basketball",
+                "2nd_quarter_team_total": "sofascore_basketball",
+                "3rd_quarter_team_total": "sofascore_basketball",
+                "4th_quarter_team_total": "sofascore_basketball",
+                "1st_half_total_points": "sofascore_basketball",
+                "1st_half_total_points_odd_even": "sofascore_basketball",
+                "2nd_half_total_points_odd_even": "sofascore_basketball",
+                "1st_half_moneyline": "sofascore_basketball",
+                "1st_half_point_spread": "sofascore_basketball",
+                "1st_half_team_total": "sofascore_basketball",
+                "2nd_half_moneyline": "sofascore_basketball",
+                "2nd_half_point_spread": "sofascore_basketball",
+                "2nd_half_total_points": "sofascore_basketball",
+                "2nd_half_team_total": "sofascore_basketball",
+                "total_points_odd_even": "sofascore_basketball",
+                "will_there_be_overtime": "sofascore_basketball",
+                "team_first_basket": "sofascore_basketball",
+                "first_basket": "sofascore_basketball",
+                "first_basket_including_ft": "sofascore_basketball",
+                "player_double_double": "sofascore_basketball",
+                "player_triple_double": "sofascore_basketball",
                 # MMA — ESPN scoreboard (with direct API fallback for past events)
                 "go_the_distance": "espn_mma",
                 "total_rounds": "espn_mma",
@@ -2906,9 +2905,6 @@ async def bets_prop_markets(
                 "last_scorer",
                 "first_td",
                 "last_td",
-                "first_basket",
-                "player_double_double",
-                "player_triple_double",
                 "player_hat_trick",
             ],
             "period_auto_settleable": sorted(_PERIOD_SETTLEABLE),
@@ -2922,12 +2918,12 @@ async def bets_prop_markets(
             "notes": (
                 "Markets in 'espn_limitation' are tracked but will not auto-settle. "
                 "Markets in 'period_auto_settleable' settle automatically from ESPN "
-                "period/linescore data (NBA quarters/halves, MLB innings, NHL periods, "
-                "soccer halftime). MLB batting props like runs, home runs, doubles, "
+                "period/linescore data for non-basketball sports (MLB innings, NHL periods). "
+                "NBA/WNBA period, specialty, and player markets settle via SofaScore "
+                "(basketball_sofascore_props) with DataBallr/ESPN fallback. "
+                "MLB batting props like runs, home runs, doubles, "
                 "triples, bases, and singles settle from Baseball Savant /gf via the "
                 "mlb_period_props module. "
-                "NBA period player-points markets (1Q/2Q/3Q/4Q/1H/2H) settle via "
-                "nba_period_props (DataBallr play-by-play and box score). "
                 "MMA markets (go_the_distance, total_rounds, moneyline) settle via "
                 "ESPN UFC scoreboard with direct API fallback for past bouts. "
                 "Pick values for go_the_distance: yes/over (went distance) or no/under (early finish). "
