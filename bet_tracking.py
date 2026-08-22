@@ -341,6 +341,10 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_shared_settlements_next_retry ON shared_settlements(next_retry_at)"
         )
 
+        import auto_settle_runs
+
+        auto_settle_runs.init_tables(con)
+
         if "shared_bet_id" not in cols:
             con.execute(
                 "ALTER TABLE bets ADD COLUMN shared_bet_id TEXT REFERENCES shared_bets(shared_bet_id)"
@@ -1229,6 +1233,9 @@ def settle_bet(
                 settled_at,
             ),
         )
+        import auto_settle_runs
+
+        auto_settle_runs.clear_shared_settle_job(shared_bet_id, con=con)
 
         cur = con.execute(
             """
@@ -1710,3 +1717,20 @@ def empty_user_analytics(
         "to": date_to,
     }
     return result
+
+
+# Auto-settle worker + cron run logs (see auto_settle_runs.py)
+from auto_settle_runs import (  # noqa: E402
+    clear_shared_settle_job,
+    finish_auto_settle_run,
+    get_auto_settle_run_details,
+    list_auto_settle_runs,
+    list_due_shared_bets_for_cookie_users,
+    list_shared_settle_jobs_needing_review,
+    list_shared_settlements_needing_review,
+    record_auto_settle_run_detail,
+    record_shared_settle_job,
+    record_shared_settlement_check,
+    requeue_shared_settle_job,
+    start_auto_settle_run,
+)
