@@ -375,8 +375,8 @@ def main() -> None:
     parser.add_argument(
         "--limit",
         type=int,
-        default=int(os.environ.get("AUTO_SETTLE_LIMIT", "50")),
-        help="Max shared bets to process this run (default 50)",
+        default=int(os.environ.get("AUTO_SETTLE_LIMIT", "500")),
+        help="Max shared bets to process this run (default 500)",
     )
     parser.add_argument(
         "--max-attempts",
