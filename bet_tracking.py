@@ -450,6 +450,51 @@ def init_db() -> None:
         # Must run after api_users exists so mirrors can be tagged correctly.
         _migrate_users_auth_source(con)
 
+        user_cols = {
+            row["name"] for row in con.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "can_auto_approve_settlement" not in user_cols:
+            con.execute(
+                "ALTER TABLE users ADD COLUMN can_auto_approve_settlement "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS settlement_change_requests (
+                request_id          TEXT PRIMARY KEY,
+                created_at          TEXT NOT NULL,
+                updated_at          TEXT NOT NULL,
+                requester_user_id   TEXT NOT NULL REFERENCES users(user_id),
+                bet_id              TEXT NOT NULL REFERENCES user_bets(bet_id),
+                shared_bet_id       TEXT REFERENCES shared_bets(shared_bet_id),
+                current_outcome     TEXT NOT NULL,
+                proposed_outcome    TEXT NOT NULL,
+                note                TEXT,
+                status              TEXT NOT NULL DEFAULT 'pending',
+                reviewed_at         TEXT,
+                reviewed_by         TEXT,
+                admin_note          TEXT,
+                applied_bet_count   INTEGER,
+                auto_approved       INTEGER NOT NULL DEFAULT 0
+            )
+            """)
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scr_status "
+            "ON settlement_change_requests(status)"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scr_requester "
+            "ON settlement_change_requests(requester_user_id)"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scr_shared "
+            "ON settlement_change_requests(shared_bet_id)"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scr_bet "
+            "ON settlement_change_requests(bet_id)"
+        )
+
         # Backfill existing bets into shared_bets on first startup after migration.
         rows = con.execute("""
             SELECT bet_id, event_id, sport, league, date, event, event_datetime,
@@ -802,7 +847,8 @@ def list_users(limit: int = 50, offset: int = 0) -> tuple[list[dict[str, Any]], 
         total = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         rows = con.execute(
             """
-            SELECT u.user_id, u.email, u.created_at,
+            SELECT u.user_id, u.email, u.created_at, u.auth_source,
+                 COALESCE(u.can_auto_approve_settlement, 0) AS can_auto_approve_settlement,
                  COUNT(ub.bet_id)                                        AS total_bets,
                  SUM(CASE WHEN ub.status = 'pending' THEN 1 ELSE 0 END) AS pending_bets,
                  SUM(CASE WHEN ub.status = 'win'     THEN 1 ELSE 0 END) AS wins,
@@ -816,6 +862,84 @@ def list_users(limit: int = 50, offset: int = 0) -> tuple[list[dict[str, Any]], 
             (limit, offset),
         ).fetchall()
     return [dict(r) for r in rows], total
+
+
+def list_managed_users(
+    limit: int = 200,
+    offset: int = 0,
+    auth_source: str | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """All tracking users (cookie + api_key) for admin user management."""
+    where: list[str] = []
+    params: list[Any] = []
+    if auth_source in (AUTH_SOURCE_COOKIE, AUTH_SOURCE_API_KEY):
+        where.append("u.auth_source = ?")
+        params.append(auth_source)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+
+    with _conn() as con:
+        total = con.execute(
+            f"SELECT COUNT(*) FROM users u {clause}", params
+        ).fetchone()[0]
+        rows = con.execute(
+            f"""
+            SELECT u.user_id, u.email, u.created_at, u.auth_source,
+                   COALESCE(u.can_auto_approve_settlement, 0)
+                     AS can_auto_approve_settlement,
+                   au.name AS api_name,
+                   au.organization,
+                   au.is_active AS api_is_active,
+                   au.api_key_prefix,
+                   COUNT(ub.bet_id) AS total_bets
+            FROM users u
+            LEFT JOIN api_users au ON au.user_id = u.user_id
+            LEFT JOIN user_bets ub ON ub.user_id = u.user_id
+            {clause}
+            GROUP BY u.user_id
+            ORDER BY u.created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        ).fetchall()
+
+    users: list[dict[str, Any]] = []
+    for r in rows:
+        rec = dict(r)
+        rec["can_auto_approve_settlement"] = bool(rec.get("can_auto_approve_settlement"))
+        rec["display_name"] = rec.get("api_name") or rec.get("email")
+        users.append(rec)
+    return users, total
+
+
+def set_user_auto_approve(user_id: str, enabled: bool) -> dict[str, Any] | None:
+    with _conn() as con:
+        cur = con.execute(
+            "UPDATE users SET can_auto_approve_settlement = ? WHERE user_id = ?",
+            (1 if enabled else 0, user_id),
+        )
+        if cur.rowcount == 0:
+            return None
+        row = con.execute(
+            "SELECT user_id, email, auth_source, created_at, "
+            "can_auto_approve_settlement FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    if not row:
+        return None
+    rec = dict(row)
+    rec["can_auto_approve_settlement"] = bool(rec.get("can_auto_approve_settlement"))
+    return rec
+
+
+def user_can_auto_approve(user_id: str | None) -> bool:
+    if not user_id:
+        return False
+    with _conn() as con:
+        row = con.execute(
+            "SELECT can_auto_approve_settlement FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return bool(row and row["can_auto_approve_settlement"])
 
 
 # ---------------------------------------------------------------------------
@@ -1717,6 +1841,461 @@ def empty_user_analytics(
         "to": date_to,
     }
     return result
+
+
+# ---------------------------------------------------------------------------
+# Settlement change requests (user review + admin approve / auto-approve)
+# ---------------------------------------------------------------------------
+
+_SETTLED_OUTCOMES = frozenset({"win", "loss", "push", "void"})
+
+
+def _scr_row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if not row:
+        return None
+    rec = dict(row)
+    rec["auto_approved"] = bool(rec.get("auto_approved"))
+    return rec
+
+
+def apply_settlement_outcome_change(
+    *,
+    bet_id: str,
+    new_outcome: str,
+    source: str,
+    note: str | None = None,
+    home_score: float | None = None,
+    away_score: float | None = None,
+    player_stat_value: float | None = None,
+    stat_name: str | None = None,
+) -> dict[str, Any]:
+    """
+    Change an already-settled (or pending) outcome.
+
+    When the ticket has a shared_bet_id, updates the canonical shared_settlements
+    row and fans out to ALL user_bets linked to that shared definition.
+    Otherwise updates only the single ticket.
+    """
+    outcome = (new_outcome or "").strip().lower()
+    if outcome not in _SETTLED_OUTCOMES:
+        raise ValueError(
+            f"outcome must be one of: {', '.join(sorted(_SETTLED_OUTCOMES))}"
+        )
+
+    settled_at = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        bet_row = con.execute(
+            "SELECT * FROM user_bets WHERE bet_id = ?", (bet_id,)
+        ).fetchone()
+        if not bet_row:
+            raise ValueError(f"Bet {bet_id!r} not found")
+
+        shared_bet_id = bet_row["shared_bet_id"]
+        # Preserve existing score/stat fields when caller omits them.
+        hs = home_score if home_score is not None else bet_row["home_score"]
+        aws = away_score if away_score is not None else bet_row["away_score"]
+        psv = (
+            player_stat_value
+            if player_stat_value is not None
+            else bet_row["player_stat_value"]
+        )
+        sn = stat_name if stat_name is not None else bet_row["stat_name"]
+
+        if shared_bet_id:
+            con.execute(
+                """
+                INSERT INTO shared_settlements (
+                    shared_bet_id, status, outcome, settled, source, settled_at,
+                    home_score, away_score, player_stat_value, stat_name,
+                    note, checked_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(shared_bet_id) DO UPDATE SET
+                    status = excluded.status,
+                    outcome = excluded.outcome,
+                    settled = excluded.settled,
+                    source = excluded.source,
+                    settled_at = excluded.settled_at,
+                    home_score = excluded.home_score,
+                    away_score = excluded.away_score,
+                    player_stat_value = excluded.player_stat_value,
+                    stat_name = excluded.stat_name,
+                    note = excluded.note,
+                    checked_at = excluded.checked_at
+                """,
+                (
+                    shared_bet_id,
+                    outcome,
+                    outcome,
+                    1,
+                    source,
+                    settled_at,
+                    hs,
+                    aws,
+                    psv,
+                    sn,
+                    note,
+                    settled_at,
+                ),
+            )
+            import auto_settle_runs
+
+            auto_settle_runs.clear_shared_settle_job(shared_bet_id, con=con)
+
+            cur = con.execute(
+                """
+                UPDATE user_bets
+                SET    outcome = ?, status = ?, settled_at = ?,
+                       settlement_source = ?, home_score = ?, away_score = ?,
+                       player_stat_value = ?, stat_name = ?
+                WHERE  shared_bet_id = ?
+                """,
+                (
+                    outcome,
+                    outcome,
+                    settled_at,
+                    source,
+                    hs,
+                    aws,
+                    psv,
+                    sn,
+                    shared_bet_id,
+                ),
+            )
+            affected = cur.rowcount
+        else:
+            cur = con.execute(
+                """
+                UPDATE user_bets
+                SET    outcome = ?, status = ?, settled_at = ?,
+                       settlement_source = ?, home_score = ?, away_score = ?,
+                       player_stat_value = ?, stat_name = ?
+                WHERE  bet_id = ?
+                """,
+                (
+                    outcome,
+                    outcome,
+                    settled_at,
+                    source,
+                    hs,
+                    aws,
+                    psv,
+                    sn,
+                    bet_id,
+                ),
+            )
+            affected = cur.rowcount
+
+    return {
+        "bet_id": bet_id,
+        "shared_bet_id": shared_bet_id,
+        "outcome": outcome,
+        "source": source,
+        "affected_bet_count": affected,
+        "settled_at": settled_at,
+    }
+
+
+def get_pending_settlement_change_request(
+    *,
+    bet_id: str | None = None,
+    shared_bet_id: str | None = None,
+    requester_user_id: str | None = None,
+) -> dict[str, Any] | None:
+    where = ["status = 'pending'"]
+    params: list[Any] = []
+    if requester_user_id:
+        where.append("requester_user_id = ?")
+        params.append(requester_user_id)
+    if shared_bet_id:
+        where.append("shared_bet_id = ?")
+        params.append(shared_bet_id)
+    elif bet_id:
+        where.append("bet_id = ?")
+        params.append(bet_id)
+    else:
+        return None
+
+    with _conn() as con:
+        row = con.execute(
+            f"""
+            SELECT * FROM settlement_change_requests
+            WHERE {' AND '.join(where)}
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+    return _scr_row_to_dict(row)
+
+
+def create_settlement_change_request(
+    *,
+    requester_user_id: str,
+    bet_id: str,
+    proposed_outcome: str,
+    note: str | None = None,
+    auto_approve: bool = False,
+    reviewed_by: str | None = None,
+) -> dict[str, Any]:
+    proposed = (proposed_outcome or "").strip().lower()
+    if proposed not in _SETTLED_OUTCOMES:
+        raise ValueError(
+            f"proposed_outcome must be one of: {', '.join(sorted(_SETTLED_OUTCOMES))}"
+        )
+
+    with _conn() as con:
+        bet = con.execute(
+            "SELECT * FROM user_bets WHERE bet_id = ?", (bet_id,)
+        ).fetchone()
+        if not bet:
+            raise ValueError(f"Bet {bet_id!r} not found")
+        if bet["user_id"] != requester_user_id:
+            raise PermissionError("Bet does not belong to this user")
+        current = (bet["status"] or "").strip().lower()
+        if current not in _SETTLED_OUTCOMES:
+            raise ValueError("Only settled bets can request a settlement change")
+        if proposed == current:
+            raise ValueError("Proposed outcome must differ from the current result")
+
+        shared_bet_id = bet["shared_bet_id"]
+        pending_q = "status = 'pending' AND requester_user_id = ?"
+        pending_params: list[Any] = [requester_user_id]
+        if shared_bet_id:
+            pending_q += " AND shared_bet_id = ?"
+            pending_params.append(shared_bet_id)
+        else:
+            pending_q += " AND bet_id = ?"
+            pending_params.append(bet_id)
+        existing = con.execute(
+            f"SELECT request_id FROM settlement_change_requests WHERE {pending_q}",
+            pending_params,
+        ).fetchone()
+        if existing:
+            raise ValueError("A pending settlement change request already exists")
+
+    current_outcome = current
+    shared_id = shared_bet_id
+
+    now = datetime.now(timezone.utc).isoformat()
+    request_id = str(uuid.uuid4())
+    status = "pending"
+    applied_count: int | None = None
+    reviewed_at: str | None = None
+    auto_flag = 0
+    reviewer = reviewed_by
+
+    if auto_approve:
+        result = apply_settlement_outcome_change(
+            bet_id=bet_id,
+            new_outcome=proposed,
+            source="user_auto_approve",
+            note=note,
+        )
+        status = "approved"
+        applied_count = result["affected_bet_count"]
+        reviewed_at = now
+        auto_flag = 1
+        reviewer = reviewed_by or requester_user_id
+
+    with _conn() as con:
+        con.execute(
+            """
+            INSERT INTO settlement_change_requests (
+                request_id, created_at, updated_at, requester_user_id,
+                bet_id, shared_bet_id, current_outcome, proposed_outcome,
+                note, status, reviewed_at, reviewed_by, admin_note,
+                applied_bet_count, auto_approved
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                request_id,
+                now,
+                now,
+                requester_user_id,
+                bet_id,
+                shared_id,
+                current_outcome,
+                proposed,
+                note,
+                status,
+                reviewed_at,
+                reviewer,
+                None,
+                applied_count,
+                auto_flag,
+            ),
+        )
+        row = con.execute(
+            "SELECT * FROM settlement_change_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+    return _scr_row_to_dict(row)  # type: ignore[return-value]
+
+
+def list_settlement_change_requests(
+    *,
+    status: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    where: list[str] = []
+    params: list[Any] = []
+    if status:
+        where.append("r.status = ?")
+        params.append(status.strip().lower())
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+
+    with _conn() as con:
+        total = con.execute(
+            f"SELECT COUNT(*) FROM settlement_change_requests r {clause}",
+            params,
+        ).fetchone()[0]
+        rows = con.execute(
+            f"""
+            SELECT r.*,
+                   u.email AS requester_email,
+                   u.auth_source AS requester_auth_source,
+                   ub.event AS bet_event,
+                   ub.market AS bet_market,
+                   ub.pick AS bet_pick,
+                   ub.selection_line AS bet_selection_line,
+                   ub.league AS bet_league,
+                   ub.sport AS bet_sport,
+                   ub.date AS bet_date,
+                   ub.home_team AS bet_home_team,
+                   ub.away_team AS bet_away_team,
+                   ub.player AS bet_player,
+                   ub.line AS bet_line
+            FROM settlement_change_requests r
+            LEFT JOIN users u ON u.user_id = r.requester_user_id
+            LEFT JOIN user_bets ub ON ub.bet_id = r.bet_id
+            {clause}
+            ORDER BY
+              CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,
+              r.created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        ).fetchall()
+
+    return [_scr_row_to_dict(r) for r in rows], total  # type: ignore[misc]
+
+
+def get_settlement_change_request(request_id: str) -> dict[str, Any] | None:
+    with _conn() as con:
+        row = con.execute(
+            """
+            SELECT r.*,
+                   u.email AS requester_email,
+                   u.auth_source AS requester_auth_source,
+                   ub.event AS bet_event,
+                   ub.market AS bet_market,
+                   ub.pick AS bet_pick,
+                   ub.selection_line AS bet_selection_line,
+                   ub.league AS bet_league,
+                   ub.sport AS bet_sport,
+                   ub.date AS bet_date
+            FROM settlement_change_requests r
+            LEFT JOIN users u ON u.user_id = r.requester_user_id
+            LEFT JOIN user_bets ub ON ub.bet_id = r.bet_id
+            WHERE r.request_id = ?
+            """,
+            (request_id,),
+        ).fetchone()
+    return _scr_row_to_dict(row)
+
+
+def approve_settlement_change_request(
+    request_id: str,
+    *,
+    reviewed_by: str,
+    admin_note: str | None = None,
+) -> dict[str, Any]:
+    req = get_settlement_change_request(request_id)
+    if not req:
+        raise ValueError("Request not found")
+    if req["status"] != "pending":
+        raise ValueError(f"Request is already {req['status']}")
+
+    result = apply_settlement_outcome_change(
+        bet_id=req["bet_id"],
+        new_outcome=req["proposed_outcome"],
+        source="admin_review",
+        note=admin_note or req.get("note"),
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        con.execute(
+            """
+            UPDATE settlement_change_requests
+            SET status = 'approved',
+                updated_at = ?,
+                reviewed_at = ?,
+                reviewed_by = ?,
+                admin_note = ?,
+                applied_bet_count = ?,
+                auto_approved = 0
+            WHERE request_id = ?
+            """,
+            (
+                now,
+                now,
+                reviewed_by,
+                admin_note,
+                result["affected_bet_count"],
+                request_id,
+            ),
+        )
+    updated = get_settlement_change_request(request_id)
+    assert updated is not None
+    updated["apply_result"] = result
+    return updated
+
+
+def deny_settlement_change_request(
+    request_id: str,
+    *,
+    reviewed_by: str,
+    admin_note: str | None = None,
+) -> dict[str, Any]:
+    req = get_settlement_change_request(request_id)
+    if not req:
+        raise ValueError("Request not found")
+    if req["status"] != "pending":
+        raise ValueError(f"Request is already {req['status']}")
+
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        con.execute(
+            """
+            UPDATE settlement_change_requests
+            SET status = 'denied',
+                updated_at = ?,
+                reviewed_at = ?,
+                reviewed_by = ?,
+                admin_note = ?
+            WHERE request_id = ?
+            """,
+            (now, now, reviewed_by, admin_note, request_id),
+        )
+    updated = get_settlement_change_request(request_id)
+    assert updated is not None
+    return updated
+
+
+def list_pending_settlement_change_requests_for_user(
+    user_id: str,
+) -> list[dict[str, Any]]:
+    with _conn() as con:
+        rows = con.execute(
+            """
+            SELECT * FROM settlement_change_requests
+            WHERE requester_user_id = ? AND status = 'pending'
+            ORDER BY created_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+    return [_scr_row_to_dict(r) for r in rows]  # type: ignore[misc]
 
 
 # Auto-settle worker + cron run logs (see auto_settle_runs.py)

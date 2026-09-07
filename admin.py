@@ -1,7 +1,8 @@
 """
 admin.py
 ========
-Admin-only router for managing API users and their access keys.
+Admin-only router for managing API users, tracking users, and settlement
+change reviews.
 
 Authentication: admin_token HttpOnly cookie (JWT), issued by POST /admin/login.
 Credentials are hardcoded for now — only one admin account exists.
@@ -11,10 +12,11 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
+from typing import Optional
 
 import jwt
 from dotenv import load_dotenv
-from fastapi import APIRouter, Cookie, HTTPException, Request
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -88,6 +90,14 @@ class CreateApiUserRequest(BaseModel):
     notes:        str | None = Field(None)
 
 
+class AutoApproveRequest(BaseModel):
+    enabled: bool
+
+
+class ReviewDecisionRequest(BaseModel):
+    admin_note: Optional[str] = Field(None, max_length=2000)
+
+
 # ---------------------------------------------------------------------------
 # Auth endpoints
 # ---------------------------------------------------------------------------
@@ -136,14 +146,13 @@ async def admin_check(admin_token: str = Cookie(None)):
 # ---------------------------------------------------------------------------
 
 @router.get("/users")
-async def list_api_users(admin=None):
-    admin  # dependency not needed here — route guarded by include_router dep
+async def list_api_users(admin=Depends(_require_admin)):
     users = await run_in_threadpool(bet_tracking.list_api_users)
     return {"users": users, "total": len(users)}
 
 
 @router.post("/users", status_code=201)
-async def create_api_user(body: CreateApiUserRequest):
+async def create_api_user(body: CreateApiUserRequest, admin=Depends(_require_admin)):
     try:
         user = await run_in_threadpool(
             bet_tracking.create_api_user,
@@ -159,7 +168,7 @@ async def create_api_user(body: CreateApiUserRequest):
 
 
 @router.get("/users/{user_id}")
-async def get_api_user(user_id: str):
+async def get_api_user(user_id: str, admin=Depends(_require_admin)):
     user = await run_in_threadpool(bet_tracking.get_api_user_by_id, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="API user not found")
@@ -167,7 +176,7 @@ async def get_api_user(user_id: str):
 
 
 @router.post("/users/{user_id}/regenerate-key")
-async def regenerate_api_key(user_id: str):
+async def regenerate_api_key(user_id: str, admin=Depends(_require_admin)):
     result = await run_in_threadpool(bet_tracking.regenerate_api_key, user_id)
     if not result:
         raise HTTPException(status_code=404, detail="API user not found")
@@ -175,7 +184,7 @@ async def regenerate_api_key(user_id: str):
 
 
 @router.patch("/users/{user_id}/deactivate")
-async def deactivate_api_user(user_id: str):
+async def deactivate_api_user(user_id: str, admin=Depends(_require_admin)):
     ok = await run_in_threadpool(bet_tracking.set_api_user_active, user_id, False)
     if not ok:
         raise HTTPException(status_code=404, detail="API user not found")
@@ -183,7 +192,7 @@ async def deactivate_api_user(user_id: str):
 
 
 @router.patch("/users/{user_id}/activate")
-async def activate_api_user(user_id: str):
+async def activate_api_user(user_id: str, admin=Depends(_require_admin)):
     ok = await run_in_threadpool(bet_tracking.set_api_user_active, user_id, True)
     if not ok:
         raise HTTPException(status_code=404, detail="API user not found")
@@ -191,8 +200,141 @@ async def activate_api_user(user_id: str):
 
 
 @router.delete("/users/{user_id}")
-async def delete_api_user(user_id: str):
+async def delete_api_user(user_id: str, admin=Depends(_require_admin)):
     ok = await run_in_threadpool(bet_tracking.delete_api_user, user_id)
     if not ok:
         raise HTTPException(status_code=404, detail="API user not found")
     return {"deleted": True, "user_id": user_id}
+
+
+# ---------------------------------------------------------------------------
+# Unified user management (cookie + API key) — auto-approve toggles
+# ---------------------------------------------------------------------------
+
+@router.get("/managed-users")
+async def list_managed_users(
+    auth_source: Optional[str] = Query(None, description="cookie | api_key"),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    admin=Depends(_require_admin),
+):
+    if auth_source and auth_source not in (
+        bet_tracking.AUTH_SOURCE_COOKIE,
+        bet_tracking.AUTH_SOURCE_API_KEY,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="auth_source must be 'cookie' or 'api_key'",
+        )
+    users, total = await run_in_threadpool(
+        bet_tracking.list_managed_users,
+        limit=limit,
+        offset=offset,
+        auth_source=auth_source,
+    )
+    return {
+        "users": users,
+        "total": total,
+        "returned": len(users),
+        "offset": offset,
+        "limit": limit,
+    }
+
+
+@router.patch("/managed-users/{user_id}/auto-approve")
+async def set_managed_user_auto_approve(
+    user_id: str,
+    body: AutoApproveRequest,
+    admin=Depends(_require_admin),
+):
+    updated = await run_in_threadpool(
+        bet_tracking.set_user_auto_approve, user_id, body.enabled
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# Settlement change request reviews
+# ---------------------------------------------------------------------------
+
+@router.get("/settlement-requests")
+async def list_settlement_requests(
+    status: Optional[str] = Query(None, description="pending | approved | denied"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    admin=Depends(_require_admin),
+):
+    if status and status not in ("pending", "approved", "denied"):
+        raise HTTPException(
+            status_code=400,
+            detail="status must be pending, approved, or denied",
+        )
+    requests, total = await run_in_threadpool(
+        bet_tracking.list_settlement_change_requests,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
+    return {
+        "requests": requests,
+        "total": total,
+        "returned": len(requests),
+        "offset": offset,
+        "limit": limit,
+    }
+
+
+@router.get("/settlement-requests/{request_id}")
+async def get_settlement_request(request_id: str, admin=Depends(_require_admin)):
+    req = await run_in_threadpool(
+        bet_tracking.get_settlement_change_request, request_id
+    )
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+    return req
+
+
+@router.post("/settlement-requests/{request_id}/approve")
+async def approve_settlement_request(
+    request_id: str,
+    body: ReviewDecisionRequest = ReviewDecisionRequest(),
+    admin=Depends(_require_admin),
+):
+    reviewed_by = admin.get("sub") or _ADMIN_EMAIL or "admin"
+    try:
+        result = await run_in_threadpool(
+            bet_tracking.approve_settlement_change_request,
+            request_id,
+            reviewed_by=reviewed_by,
+            admin_note=body.admin_note,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if msg == "Request not found":
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=409, detail=msg)
+    return result
+
+
+@router.post("/settlement-requests/{request_id}/deny")
+async def deny_settlement_request(
+    request_id: str,
+    body: ReviewDecisionRequest = ReviewDecisionRequest(),
+    admin=Depends(_require_admin),
+):
+    reviewed_by = admin.get("sub") or _ADMIN_EMAIL or "admin"
+    try:
+        result = await run_in_threadpool(
+            bet_tracking.deny_settlement_change_request,
+            request_id,
+            reviewed_by=reviewed_by,
+            admin_note=body.admin_note,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if msg == "Request not found":
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=409, detail=msg)
+    return result

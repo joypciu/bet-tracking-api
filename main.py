@@ -3351,6 +3351,111 @@ async def manual_settle_bet(
     return JSONResponse(_bet_response(bet, settlement))
 
 
+class SettlementChangeRequestBody(BaseModel):
+    proposed_outcome: str = Field(..., description="win | loss | push | void")
+    note: Optional[str] = Field(None, max_length=2000)
+
+    @field_validator("proposed_outcome")
+    @classmethod
+    def validate_proposed_outcome(cls, v: str) -> str:
+        allowed = {"win", "loss", "push", "void"}
+        norm = v.strip().lower()
+        if norm not in allowed:
+            raise ValueError(
+                f"proposed_outcome must be one of: {', '.join(sorted(allowed))}"
+            )
+        return norm
+
+
+@app.post("/bets/{bet_id}/settlement-change-request", tags=["bets"])
+async def request_settlement_change(
+    bet_id: str,
+    body: SettlementChangeRequestBody = Body(...),
+    auth_user: dict = Depends(require_auth),
+) -> JSONResponse:
+    """
+    Request a change to a settled bet's outcome.
+
+    Users with can_auto_approve_settlement apply the change immediately
+    (fans out to all tickets sharing the same shared_bet_id).
+    Otherwise a pending request is queued for admin review.
+    """
+    if not _is_user_scoped_auth(auth_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Settlement change requests require a user session",
+        )
+
+    user_id, _ = await _resolve_scoped_user_id(auth_user)
+    if not user_id and auth_user.get("auth_type") == "cookie" and auth_user.get("email"):
+        db_user = await run_in_threadpool(
+            bet_tracking.create_or_get_user,
+            auth_user["email"],
+            auth_source=bet_tracking.AUTH_SOURCE_COOKIE,
+        )
+        user_id = db_user["user_id"]
+    if not user_id:
+        raise HTTPException(status_code=403, detail="Unable to resolve user identity")
+
+    can_auto = await run_in_threadpool(bet_tracking.user_can_auto_approve, user_id)
+    try:
+        request_rec = await run_in_threadpool(
+            bet_tracking.create_settlement_change_request,
+            requester_user_id=user_id,
+            bet_id=bet_id,
+            proposed_outcome=body.proposed_outcome,
+            note=body.note,
+            auto_approve=can_auto,
+            reviewed_by=(auth_user.get("email") or user_id) if can_auto else None,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        msg = str(exc)
+        if "not found" in msg.lower():
+            raise HTTPException(status_code=404, detail=msg)
+        if "already exists" in msg.lower():
+            raise HTTPException(status_code=409, detail=msg)
+        raise HTTPException(status_code=400, detail=msg)
+
+    bet = await run_in_threadpool(bet_tracking.get_bet, bet_id)
+    payload: dict[str, Any] = {
+        "request": request_rec,
+        "auto_approved": bool(request_rec.get("auto_approved")),
+    }
+    if bet:
+        payload["bet"] = _bet_response(bet, _stored_settlement(bet))
+    return JSONResponse(
+        status_code=200 if can_auto else 201,
+        content=payload,
+    )
+
+
+@app.get("/bets/{bet_id}/settlement-change-request", tags=["bets"])
+async def get_my_settlement_change_request(
+    bet_id: str,
+    auth_user: dict = Depends(require_auth),
+) -> JSONResponse:
+    """Return the caller's pending settlement change request for this bet, if any."""
+    if not _is_user_scoped_auth(auth_user):
+        raise HTTPException(status_code=403, detail="User session required")
+    user_id, _ = await _resolve_scoped_user_id(auth_user)
+    if not user_id:
+        return JSONResponse({"request": None})
+
+    bet = await run_in_threadpool(bet_tracking.get_bet, bet_id)
+    if not bet:
+        raise HTTPException(status_code=404, detail=f"Bet {bet_id!r} not found")
+
+    req = await run_in_threadpool(
+        bet_tracking.get_pending_settlement_change_request,
+        bet_id=bet_id if not bet.get("shared_bet_id") else None,
+        shared_bet_id=bet.get("shared_bet_id"),
+        requester_user_id=user_id,
+    )
+    return JSONResponse({"request": req})
+
+
 @app.delete("/bets/{bet_id}", tags=["bets"])
 async def delete_bet(
     bet_id: str,
@@ -3383,6 +3488,40 @@ async def list_users(
             "offset": offset,
             "limit": limit,
             "users": users,
+        }
+    )
+
+
+@app.get("/users/me", tags=["users"])
+async def get_me(auth_user: dict = Depends(require_auth)) -> JSONResponse:
+    """Return the authenticated tracking user profile + capabilities."""
+    if not _is_user_scoped_auth(auth_user):
+        raise HTTPException(status_code=403, detail="User session required")
+
+    user_id, email = await _resolve_scoped_user_id(auth_user)
+    if not user_id and auth_user.get("auth_type") == "cookie" and auth_user.get("email"):
+        db_user = await run_in_threadpool(
+            bet_tracking.create_or_get_user,
+            auth_user["email"],
+            auth_source=bet_tracking.AUTH_SOURCE_COOKIE,
+        )
+        user_id = db_user["user_id"]
+        email = db_user["email"]
+
+    db_user = (
+        await run_in_threadpool(bet_tracking.get_user_by_id, user_id)
+        if user_id
+        else None
+    )
+    can_auto = bool(db_user and db_user.get("can_auto_approve_settlement"))
+    return JSONResponse(
+        {
+            "user_id": user_id,
+            "email": email or auth_user.get("email"),
+            "name": auth_user.get("name"),
+            "auth_type": auth_user.get("auth_type"),
+            "auth_source": (db_user or {}).get("auth_source"),
+            "can_auto_approve_settlement": can_auto,
         }
     )
 
