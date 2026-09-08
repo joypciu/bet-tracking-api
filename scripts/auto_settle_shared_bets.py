@@ -49,7 +49,7 @@ import bet_tracking  # noqa: E402
 import auto_settle_runs  # noqa: E402
 from main import (  # noqa: E402
     _build_settlement,
-    _calculate_clv_for_bet,
+    _calculate_clv_after_settlement,
     _is_future_game,
 )
 
@@ -146,25 +146,11 @@ def _release_lock(fh) -> None:
         pass
 
 
-async def _maybe_clv_for_shared(shared_bet_id: str) -> int:
-    """Fire CLV for newly settled tickets that still need it."""
-    with bet_tracking._conn() as con:
-        rows = con.execute(
-            """
-            SELECT bet_id
-            FROM user_bets
-            WHERE shared_bet_id = ?
-              AND status IN ('win', 'loss', 'push', 'void')
-              AND historics_context IS NOT NULL
-              AND clv_calculated_at IS NULL
-            """,
-            (shared_bet_id,),
-        ).fetchall()
-    count = 0
-    for row in rows:
-        await _calculate_clv_for_bet(row["bet_id"])
-        count += 1
-    return count
+async def _maybe_clv_for_shared(representative_bet_id: str) -> int:
+    """Fire CLV for newly settled tickets that still need it (all shared siblings)."""
+    before = bet_tracking.list_bet_ids_needing_clv_after_settle(representative_bet_id)
+    await _calculate_clv_after_settlement(representative_bet_id)
+    return len(before)
 
 
 async def _process_one(
@@ -234,7 +220,7 @@ async def _process_one(
     if settled:
         log.info("SETTLED %s -> %s", label, outcome)
         try:
-            await _maybe_clv_for_shared(shared_bet_id)
+            await _maybe_clv_for_shared(bet["bet_id"])
         except Exception as exc:
             log.warning("CLV follow-up failed for %s: %s", shared_bet_id[:8], exc)
         return _result(bet, "settled", outcome=outcome, note=note_str)

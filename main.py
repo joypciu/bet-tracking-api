@@ -2362,6 +2362,21 @@ async def _calculate_clv_for_bet(bet_id: str) -> None:
         pass  # CLV is non-critical — must never crash settlement flow
 
 
+async def _calculate_clv_after_settlement(bet_id: str) -> None:
+    """
+    After a bet settles, calculate CLV for that ticket and every shared sibling
+    that still needs it (per-user odds/book). Fire-and-forget; never raises.
+    """
+    try:
+        bet_ids = await run_in_threadpool(
+            bet_tracking.list_bet_ids_needing_clv_after_settle, bet_id
+        )
+        for sibling_id in bet_ids:
+            await _calculate_clv_for_bet(sibling_id)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Root
 # ---------------------------------------------------------------------------
@@ -2495,7 +2510,7 @@ async def create_bet(
         "loss",
         "push",
     }:
-        asyncio.ensure_future(_calculate_clv_for_bet(bet["bet_id"]))
+        asyncio.ensure_future(_calculate_clv_after_settlement(bet["bet_id"]))
     return JSONResponse(status_code=201, content=_bet_response(bet, settlement))
 
 
@@ -2952,7 +2967,7 @@ async def get_bet(
             "loss",
             "push",
         }:
-            asyncio.ensure_future(_calculate_clv_for_bet(bet_id))
+            asyncio.ensure_future(_calculate_clv_after_settlement(bet_id))
     else:
         settlement = _stored_settlement(bet)
         if (
@@ -2960,7 +2975,7 @@ async def get_bet(
             and bet.get("historics_context")
             and bet["status"] in {"win", "loss", "push", "void"}
         ):
-            asyncio.ensure_future(_calculate_clv_for_bet(bet_id))
+            asyncio.ensure_future(_calculate_clv_after_settlement(bet_id))
     return JSONResponse(_bet_response(bet, settlement))
 
 
@@ -2985,7 +3000,7 @@ async def settle_bet(
         "loss",
         "push",
     }:
-        asyncio.ensure_future(_calculate_clv_for_bet(bet_id))
+        asyncio.ensure_future(_calculate_clv_after_settlement(bet_id))
     fresh_bet = await run_in_threadpool(bet_tracking.get_bet, bet_id)
     if fresh_bet is not None:
         bet = fresh_bet
@@ -3152,7 +3167,7 @@ async def _run_bulk_settle_pending(
         outcome = str(settlement.get("outcome") or "pending")
 
         if outcome in {"win", "loss", "push", "void"}:
-            asyncio.ensure_future(_calculate_clv_for_bet(bet["bet_id"]))
+            asyncio.ensure_future(_calculate_clv_after_settlement(bet["bet_id"]))
             summary[outcome] += 1
         elif outcome == "not_settleable":
             summary["manual_settlement_needed"] += 1
@@ -3340,7 +3355,7 @@ async def manual_settle_bet(
         )
 
     if updated:
-        asyncio.ensure_future(_calculate_clv_for_bet(bet_id))
+        asyncio.ensure_future(_calculate_clv_after_settlement(bet_id))
 
     bet = await run_in_threadpool(bet_tracking.get_bet, bet_id) or bet
     settlement = {

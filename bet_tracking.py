@@ -1406,6 +1406,51 @@ def get_shared_settlement(shared_bet_id: str | None) -> dict[str, Any] | None:
     return _row_to_dict(row)
 
 
+def list_bet_ids_needing_clv_after_settle(bet_id: str) -> list[str]:
+    """
+    Bet IDs that should get CLV after settlement of ``bet_id``.
+
+    For shared bets, returns every settled sibling ticket that still needs CLV
+    (has historics_context, clv_calculated_at IS NULL). For non-shared tickets,
+    returns ``[bet_id]`` when that ticket still needs CLV.
+    """
+    if not bet_id:
+        return []
+    with _conn() as con:
+        row = con.execute(
+            "SELECT bet_id, shared_bet_id FROM user_bets WHERE bet_id = ?",
+            (bet_id,),
+        ).fetchone()
+        if not row:
+            return []
+        shared_bet_id = row["shared_bet_id"]
+        if shared_bet_id:
+            rows = con.execute(
+                """
+                SELECT bet_id
+                FROM user_bets
+                WHERE shared_bet_id = ?
+                  AND status IN ('win', 'loss', 'push', 'void')
+                  AND historics_context IS NOT NULL
+                  AND clv_calculated_at IS NULL
+                """,
+                (shared_bet_id,),
+            ).fetchall()
+            return [str(r["bet_id"]) for r in rows]
+        need = con.execute(
+            """
+            SELECT bet_id
+            FROM user_bets
+            WHERE bet_id = ?
+              AND status IN ('win', 'loss', 'push', 'void')
+              AND historics_context IS NOT NULL
+              AND clv_calculated_at IS NULL
+            """,
+            (bet_id,),
+        ).fetchone()
+        return [str(need["bet_id"])] if need else []
+
+
 def update_bet_clv(
     bet_id: str,
     book_clv: float | None,
