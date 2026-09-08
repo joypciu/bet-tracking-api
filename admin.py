@@ -214,6 +214,7 @@ async def delete_api_user(user_id: str, admin=Depends(_require_admin)):
 @router.get("/managed-users")
 async def list_managed_users(
     auth_source: Optional[str] = Query(None, description="cookie | api_key"),
+    q: Optional[str] = Query(None, description="Search by name or email"),
     limit: int = Query(200, ge=1, le=500),
     offset: int = Query(0, ge=0),
     admin=Depends(_require_admin),
@@ -231,6 +232,7 @@ async def list_managed_users(
         limit=limit,
         offset=offset,
         auth_source=auth_source,
+        q=q,
     )
     return {
         "users": users,

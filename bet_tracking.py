@@ -868,6 +868,7 @@ def list_managed_users(
     limit: int = 200,
     offset: int = 0,
     auth_source: str | None = None,
+    q: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """All tracking users (cookie + api_key) for admin user management."""
     where: list[str] = []
@@ -875,11 +876,21 @@ def list_managed_users(
     if auth_source in (AUTH_SOURCE_COOKIE, AUTH_SOURCE_API_KEY):
         where.append("u.auth_source = ?")
         params.append(auth_source)
+    search = (q or "").strip()
+    if search:
+        where.append("(u.email LIKE ? OR IFNULL(au.name, '') LIKE ?)")
+        like = f"%{search}%"
+        params.extend([like, like])
     clause = f"WHERE {' AND '.join(where)}" if where else ""
 
     with _conn() as con:
         total = con.execute(
-            f"SELECT COUNT(*) FROM users u {clause}", params
+            f"""
+            SELECT COUNT(*) FROM users u
+            LEFT JOIN api_users au ON au.user_id = u.user_id
+            {clause}
+            """,
+            params,
         ).fetchone()[0]
         rows = con.execute(
             f"""
