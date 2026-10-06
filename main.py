@@ -555,6 +555,15 @@ _AUTO_SETTLEABLE = {
     "3rd_period_puck_line",
     "3rd_period_total_goals",
     "3rd_period_total_goals_odd_even",
+    "3rd_period_team_total",
+    "team_total_reg_time",
+    # Soccer extras (routed only when sport=soccer in stats_api)
+    "team_total_cards",
+    "total_card_points",
+    "team_total_shots",
+    "to_advance",
+    # Tennis
+    "3rd_set_moneyline",
 }
 
 # MLB period markets that should settle via stats_api market-check (Savant /gf)
@@ -654,6 +663,29 @@ _SPREAD_CORE_MARKETS = frozenset(
     {"spread", "puck_line", "run_line", "set_handicap", "game_spread"}
 )
 _SPREAD_PICK_RE = re.compile(r"^(?P<team>.+?)\s+(?P<spread>[+-]?\d+(?:\.\d+)?)$")
+_TENNIS_GAME_ML_RE = re.compile(
+    r"^(1st|2nd|3rd|4th|5th)_set_game_\d+_moneyline$"
+)
+_FOOTBALL_SPORTS = frozenset(
+    {
+        "football",
+        "nfl",
+        "american football",
+        "american-football",
+        "ncaaf",
+        "college football",
+        "college-football",
+    }
+)
+_FOOTBALL_AUTO_MARKETS = frozenset(
+    {
+        "total_touchdowns",
+        "total_field_goals",
+        "team_total_touchdowns",
+        "1st_half_total_touchdowns",
+        "first_team_to_score",
+    }
+)
 
 
 def _is_spread_market(market: str) -> bool:
@@ -663,6 +695,22 @@ def _is_spread_market(market: str) -> bool:
         or m.endswith("_point_spread")
         or m.endswith("_run_line")
     )
+
+
+def _is_auto_settle_market(market: str, sport: str) -> bool:
+    """Sport-gated auto-settle names so shared labels cannot leak across sports."""
+    if market in _AUTO_SETTLEABLE:
+        return True
+    s = (sport or "").strip().lower()
+    if "baseball" in s and market == "first_team_to_score":
+        return True
+    if s in _FOOTBALL_SPORTS and market in _FOOTBALL_AUTO_MARKETS:
+        return True
+    if (
+        "tennis" in s or s in {"atp", "wta", "itf"}
+    ) and _TENNIS_GAME_ML_RE.match(market):
+        return True
+    return False
 
 
 def _parse_spread_selection(raw: str) -> tuple[str, float] | None:
@@ -1895,7 +1943,7 @@ async def _build_settlement(bet: dict) -> dict:
         if result:
             return result
 
-    if market not in _AUTO_SETTLEABLE or not bet.get("pick"):
+    if not _is_auto_settle_market(market, sport) or not bet.get("pick"):
         return {
             "outcome": "not_settleable",
             "settled": False,
@@ -1949,6 +1997,8 @@ async def _build_settlement(bet: dict) -> dict:
         "1st_half_team_total_corners",
         "2nd_half_team_total",
         "2nd_half_team_total_corners",
+        "team_total_cards",
+        "team_total_shots",
     }
     if (
         _market in _soccer_team_markets
@@ -1973,8 +2023,27 @@ async def _build_settlement(bet: dict) -> dict:
             ):
                 query_opponent = _ht
 
-    # Basketball team_total only: parse "Seattle Storm Over 84.5" → team + over/under + line
     team_total_player = bet.get("player")
+    _sel_team_total_markets = {
+        "team_total_cards",
+        "team_total_shots",
+        "team_total_touchdowns",
+        "3rd_period_team_total",
+        "team_total_reg_time",
+        "1st_period_team_total",
+        "2nd_period_team_total",
+    }
+    if _market in _sel_team_total_markets:
+        tt_team, tt_pick, tt_line = _team_total_for_settlement(bet)
+        if tt_pick.lower() in {"over", "under"}:
+            effective_pick = tt_pick
+        if tt_line is not None:
+            line_value = tt_line
+        if tt_team:
+            query_team = tt_team
+            team_total_player = tt_team
+
+    # Basketball team_total only: parse "Seattle Storm Over 84.5" → team + over/under + line
     if _market == "team_total" and "basketball" in (bet.get("sport") or "").lower():
         tt_team, tt_pick, tt_line = _team_total_for_settlement(bet)
         effective_pick = tt_pick
@@ -2220,7 +2289,7 @@ def _is_auto_settleable_bet(bet: dict) -> bool:
     if _is_prop_market(bet.get("market", "")):
         return bool(bet.get("player")) and (bet.get("line") is not None)
 
-    return market in _AUTO_SETTLEABLE and bool(bet.get("pick"))
+    return _is_auto_settle_market(market, sport) and bool(bet.get("pick"))
 
 
 def _shared_settlement_response(shared: dict) -> dict:
